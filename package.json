@@ -1,0 +1,64 @@
+{
+  "name": "simplify3x-connect",
+  "version": "0.28.1",
+  "mcpName": "com.simplifyqa/simplify3x-connect",
+  "type": "module",
+  "description": "Simplify3x Connect: one product-neutral MCP for the QA test-case lifecycle. Drives SimplifyQA or Walnut from any AI client over stdio or HTTP.",
+  "bin": {
+    "simplify3x-connect": "dist/cli.js",
+    "common-qa-mcp": "dist/cli.js"
+  },
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "files": [
+    "dist"
+  ],
+  "license": "MIT",
+  "author": "Simplify3x",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Simplify3x/simplify3x-connect.git"
+  },
+  "keywords": [
+    "simplify3x",
+    "mcp",
+    "model-context-protocol",
+    "qa",
+    "testing",
+    "test-automation",
+    "test-cases",
+    "walnut",
+    "simplifyqa",
+    "ai-agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "dev:http": "tsx watch src/httpMain.ts",
+    "test": "jest",
+    "prepublishOnly": "npm run build",
+    "start:http": "node dist/httpMain.js",
+    "version": "node scripts/sync-version.mjs && git add src/version.ts",
+    "sync-version": "node scripts/sync-version.mjs",
+    "prebuild": "node scripts/sync-version.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.22.0",
+    "express": "^5.1.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.4",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.19.42",
+    "jest": "^30.3.0",
+    "ts-jest": "^29.4.9",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.2"
+  },
+  "homepage": "https://github.com/Simplify3x/simplify3x-connect#readme"
+}

@@ -1,0 +1,116 @@
+{
+  "_id": "665f1a2b3c4d5e6f78901234",
+  "project_id": "665f1a2b3c4d5e6f78900000",
+  "test_case_id": "TC_1042",
+  "title": "Login with valid credentials then verify API session",
+  "description": "Covers the standard login flow plus a session-check API call.",
+  "objective": "Verify a user can log in and the backend issues a valid session.",
+  "test_category": "automated",
+  "priority": "high",
+  "status": "ready",
+  "preconditions": "User account exists and is active.",
+  "expected_outcome": "User lands on the dashboard and the session API confirms authentication.",
+  "tags": ["login", "smoke"],
+  "version": 7,
+  "total_steps": 6,
+  "execution_count": 3,
+  "platform": "web",
+  "test_steps": [
+    {
+      "_id": "665f1a2b3c4d5e6f78901001",
+      "step_number": 1,
+      "step_description": "Navigate to ${base_url}/login",
+      "expected_result": "Login page loads with username and password fields visible",
+      "step_type": "web",
+      "action_type": "navigate",
+      "is_optional": false,
+      "stepLevelActions": { "skip": false, "captureScreenshot": true, "continueOnFailure": false },
+      "detected_parameters": ["base_url"]
+    },
+    {
+      "_id": "665f1a2b3c4d5e6f78901002",
+      "step_number": 2,
+      "step_description": "Type ${username} in Username field",
+      "expected_result": "Username field shows the entered value",
+      "step_type": "web",
+      "action_type": "type",
+      "input_value": "${username}",
+      "object_id": "665f1a2b3c4d5e6f78902001",
+      "is_optional": false,
+      "stepLevelActions": { "skip": false, "captureScreenshot": true, "continueOnFailure": false },
+      "detected_parameters": ["username"]
+    },
+    {
+      "_id": "665f1a2b3c4d5e6f78901003",
+      "step_number": 3,
+      "step_description": "If the Remember Me checkbox is visible",
+      "expected_result": "",
+      "step_type": "control_flow",
+      "action_type": "if_start",
+      "block_id": "blk_remember_me",
+      "condition": {
+        "type": "element_visible",
+        "selector": "input#remember-me",
+        "object_id": "665f1a2b3c4d5e6f78902002",
+        "text": null,
+        "variableName": null,
+        "variableValue": null
+      },
+      "is_optional": false,
+      "stepLevelActions": { "skip": false, "captureScreenshot": true, "continueOnFailure": false }
+    },
+    {
+      "_id": "665f1a2b3c4d5e6f78901004",
+      "step_number": 4,
+      "step_description": "Click Remember Me checkbox",
+      "expected_result": "Checkbox becomes checked",
+      "step_type": "web",
+      "action_type": "click",
+      "object_id": "665f1a2b3c4d5e6f78902002",
+      "is_optional": true,
+      "stepLevelActions": { "skip": false, "captureScreenshot": true, "continueOnFailure": false }
+    },
+    {
+      "_id": "665f1a2b3c4d5e6f78901005",
+      "step_number": 5,
+      "step_description": "End if for Remember Me checkbox",
+      "expected_result": "",
+      "step_type": "control_flow",
+      "action_type": "if_end",
+      "block_id": "blk_remember_me",
+      "is_optional": false,
+      "stepLevelActions": { "skip": false, "captureScreenshot": true, "continueOnFailure": false }
+    },
+    {
+      "_id": "665f1a2b3c4d5e6f78901006",
+      "step_number": 6,
+      "step_description": "Send GET request to ${base_url}/api/session to confirm login",
+      "expected_result": "Response status 200 with an active session in the body",
+      "step_type": "API",
+      "action_type": "api_call",
+      "is_optional": false,
+      "stepLevelActions": { "skip": false, "captureScreenshot": false, "continueOnFailure": false },
+      "api_request_data": {
+        "method": "GET",
+        "url": "${base_url}/api/session",
+        "headers": [
+          { "enabled": true, "key": "Authorization", "value": "Bearer ${auth_token}", "description": "" }
+        ],
+        "assertions": [
+          {
+            "type": "Received Response",
+            "items": [
+              { "id": "a1", "path": "status", "name": "status", "condition": "Equals", "validValue": "200" },
+              { "id": "a2", "path": "body.active", "name": "active", "condition": "Equals", "validValue": "true" }
+            ]
+          }
+        ]
+      },
+      "detected_parameters": ["base_url", "auth_token"]
+    }
+  ],
+  "created_by": { "_id": "665f1a2b3c4d5e6f78900011", "name": "Nirmal Sharma", "email": "nirmal.s@simplify3x.com" },
+  "updated_by": { "_id": "665f1a2b3c4d5e6f78900011", "name": "Nirmal Sharma", "email": "nirmal.s@simplify3x.com" },
+  "created_at": "2026-07-01T10:00:00.000Z",
+  "updated_at": "2026-07-30T14:22:00.000Z"
+}

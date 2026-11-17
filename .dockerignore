@@ -1,0 +1,17 @@
+node_modules
+dist
+.git
+.gitignore
+*.log
+logs
+.devin
+.env
+.env.*
+.mcp.json
+src/mcp.json
+**/*.test.ts
+.claude
+.cursor
+.windsurf
+.github
+.DS_Store

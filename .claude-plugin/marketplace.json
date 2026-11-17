@@ -1,0 +1,15 @@
+{
+  "name": "simplify3x",
+  "description": "Simplify3x plugins for SimplifyQA test management and automation",
+  "owner": {
+    "name": "Simplify3x",
+    "url": "https://simplifyqa.ai"
+  },
+  "plugins": [
+    {
+      "name": "simplify3x-connect",
+      "source": "./",
+      "description": "SimplifyQA test management and automation"
+    }
+  ]
+}

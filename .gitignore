@@ -1,0 +1,34 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+.DS_Store
+
+
+# init-agents outputs belong in a TARGET project, never in this package repo
+.claude/
+.cursor/
+.windsurf/
+.github/agents/
+.github/chatmodes/
+/AGENTS.md
+/walnut-qa.AGENTS.md
+
+
+# Local MCP client config — holds a live QA_MCP_TOKEN
+src/mcp.json
+.mcp.json
+
+# Local agent scratch (this machine only)
+.devin/
+
+# Jest --coverage output
+coverage/
+
+# Ship the env TEMPLATE; real .env files stay ignored
+!.env.example
+
+# Internal working docs + eval harness: kept local, not shipped
+/MCP-OPTIMISATION.md
+/eval/
