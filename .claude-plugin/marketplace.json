@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "simplify3x-connect",
-      "source": "./",
+      "source": "./plugin",
       "description": "SimplifyQA test management and automation"
     }
   ]

@@ -1,7 +1,7 @@
 {
   "name": "simplify3x-connect",
-  "displayName": "simplify3x-connect",
-  "version": "0.28.1",
+  "displayName": "Simplify3x Connect",
+  "version": "0.28.2",
   "description": "Find, write, record, run and triage SimplifyQA test cases, suites, executions and defects from Claude",
   "author": {
     "name": "Simplify3x",
@@ -19,7 +19,7 @@
     "test-management"
   ],
   "icon": "./logo.png",
-  "documentationUrl": "https://github.com/Simplify3x/simplify3x-connect#readme",
+  "documentationUrl": "https://github.com/Simplify3x/simplify3x-connect/tree/main/plugin#readme",
   "supportUrl": "https://docs.simplifyqa.ai/need-support-connect-with-us",
   "privacyPolicyUrl": "https://simplifyqa.ai/privacy",
   "termsOfServiceUrl": "https://docs.simplifyqa.ai/legal-documents/end-user-license-agreement",
