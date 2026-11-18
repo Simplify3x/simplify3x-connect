@@ -36,7 +36,7 @@ During setup, Claude asks for:
 ## What this plugin runs, sends and fetches
 
 - **Runs:** the open-source MCP server
-  [`simplify3x-connect@0.28.1`](https://www.npmjs.com/package/simplify3x-connect), started on your
+  [`simplify3x-connect@0.31.0`](https://www.npmjs.com/package/simplify3x-connect), started on your
   computer with `npx`. The first start downloads it and its dependencies from the npm registry. It
   needs Node.js 20 or later. Source code: https://github.com/Simplify3x/simplify3x-connect
 - **Sends:** requests only to the **SimplifyQA URL you enter**, authenticated with your API token,

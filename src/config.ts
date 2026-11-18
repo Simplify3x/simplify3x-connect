@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { addCredential } from './vendor/logger.js';
+import { DEFAULTS, resolveRequireClientToken } from './defaults.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -10,7 +11,6 @@ type ConfigCommon = {
   moduleId?: string;
   walnutAuth: 'key' | 'jwt';
   caps: Set<string>;
-  port?: number;
   connection?: string;
   /** Origin of a running walnut-frontend, used by tc_draft_open to build the
    * `/embed/test-case-draft` URL. Optional in both modes -- offline mode has no
@@ -71,7 +71,7 @@ export type ConnectedQaConfig = ConfigCommon & {
 
 export type QaConfig = OfflineQaConfig | ConnectedQaConfig;
 
-const DEFAULT_CAPS = ['tc', 'suites', 'runs', 'objects', 'alm'];
+const DEFAULT_CAPS = DEFAULTS.caps;
 
 // One resolution layer: only the keys a given source actually supplied.
 type ConfigLayer = Partial<QaConfig>;
@@ -89,12 +89,6 @@ function asCaps(v: unknown): Set<string> | undefined {
   const parts = Array.isArray(v) ? v.map(String) : String(v).split(',');
   const cleaned = parts.map((s) => s.trim()).filter(Boolean);
   return cleaned.length ? new Set(cleaned) : undefined;
-}
-
-function asPort(v: unknown): number | undefined {
-  if (v == null || v === '') return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
 }
 
 function asString(v: unknown): string | undefined {
@@ -121,8 +115,6 @@ function normalizeLayer(raw: Record<string, unknown>): ConfigLayer {
   if (walnutAuth) layer.walnutAuth = walnutAuth;
   const caps = asCaps(raw['caps']);
   if (caps) layer.caps = caps;
-  const port = asPort(raw['port']);
-  if (port !== undefined) layer.port = port;
   const walnutUiOrigin = asString(raw['walnutUiOrigin']);
   if (walnutUiOrigin) layer.walnutUiOrigin = walnutUiOrigin;
   const agentUrl = asString(raw['agentUrl']);
@@ -144,9 +136,7 @@ function parseEnvLayer(env: NodeJS.ProcessEnv): ConfigLayer {
     moduleId: env['QA_MCP_MODULE_ID'],
     walnutAuth: env['QA_MCP_WALNUT_AUTH'],
     caps: env['QA_MCP_CAPS'],
-    port: env['QA_MCP_PORT'],
     walnutUiOrigin: env['QA_MCP_WALNUT_UI'],
-    agentUrl: env['QA_MCP_AGENT_URL'],
     baseUrl: env['QA_BASE_URL'],
     userId: env['QA_MCP_USER_ID'],
   });
@@ -244,6 +234,22 @@ export function resolveConfig(env: NodeJS.ProcessEnv, cliFlags: Partial<QaConfig
 
   // Register the resolved token with the log redactor: even a caller that logs it raw is scrubbed.
   addCredential(merged.token);
+
+  // Per-user mode: the server says WHERE to connect, each caller says WHO they are. A server token is
+  // ignored (a session must never fall back to it), and "base URL, no token" is the intended shape,
+  // so every session starts offline and connects with the caller's own token. A server userId is ignored
+  // too: every session copies this config, so it would make every caller the same user.
+  if (resolveRequireClientToken(env)) {
+    if (!merged.baseUrl) {
+      throw new Error(
+        'QA_MCP_REQUIRE_CLIENT_TOKEN=true needs QA_BASE_URL: in per-user mode the backend URL comes ' +
+          'from the server, never from the caller.',
+      );
+    }
+    delete merged.token;
+    delete merged.userId;
+    return { ...merged, mode: 'offline' } as OfflineQaConfig;
+  }
 
   const hasToken = !!merged.token;
   const hasUrl = !!merged.url;

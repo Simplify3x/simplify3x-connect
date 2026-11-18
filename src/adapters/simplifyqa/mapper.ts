@@ -1680,7 +1680,9 @@ function buildAutomationPayload(inputs: BuildTestcasePayloadInputs): Record<stri
     const wireConditions = rawBase['conditions']
       ?? (s.controlFlow?.conditionText ? { ifstring: s.controlFlow.conditionText, children: [] as unknown[] } : { ifstring: '', children: [] as unknown[] });
     const wireLoopDuration = (typeof rawBase['loopDuration'] === 'number' ? rawBase['loopDuration'] as number : undefined)
-      ?? s.controlFlow?.maxIterations;
+      // SimplifyQA has no per-step maximum for a WHILE / DO-WHILE (the agent applies one global loop limit), so a requested
+      // maxIterations is not written as if it did something — the save's lint says so.
+      ?? (['WHILE_START', 'WHILE_END', 'WHILE', 'DO'].includes(String(wireStepType).toUpperCase()) ? undefined : s.controlFlow?.maxIterations);
     const step: Record<string, unknown> = {
       ...rawBase,
       // ponytail: `deleted` is required on UPDATE and REJECTED on CREATE by the backend validator

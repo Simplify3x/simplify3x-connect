@@ -1,5 +1,6 @@
 import type { Request } from 'express';
 import type { ConnectRequest } from './connection.js';
+import { resolveRequireClientToken } from './defaults.js';
 
 // Type-only imports above (erased at runtime), so this module has NO runtime dependency graph --
 // it's a pure parser and can be unit-tested without pulling mount.ts's Electron/browser imports.
@@ -36,13 +37,18 @@ export function connectionFromRequest(req: Request): ConnectRequest | null {
   const authz = firstHeader(req, 'authorization') ?? '';
   const token = ((authz.replace(/^Bearer\s+/i, '')) || firstHeader(req, 'x-qa-token') || '').trim();
   if (!token) return null;
+  // Per-user mode: WHERE to connect is the server's decision, so the caller's url / baseUrl / product
+  // are ignored and only the environment is used. The caller supplies only WHO (the token).
+  const perUser = resolveRequireClientToken();
+  const fromCaller = (query: string, header: string): string | undefined =>
+    perUser ? undefined : (firstQuery(req, query) ?? firstHeader(req, header));
   // `url` = the MCP endpoint to hop to (agent /mcp for walnut recording, or the SQA /mcp).
   // `baseUrl` = the Walnut BACKEND REST base for DIRECT data ops (QA_BASE_URL). Either one (with a
   // token) is a usable connection; a walnut direct session needs only baseUrl.
-  const url = (firstQuery(req, 'url') ?? firstHeader(req, 'x-qa-url') ?? process.env['QA_MCP_URL'] ?? '').trim();
-  const baseUrl = (firstQuery(req, 'baseUrl') ?? firstHeader(req, 'x-qa-base-url') ?? process.env['QA_BASE_URL'] ?? '').trim();
+  const url = (fromCaller('url', 'x-qa-url') ?? process.env['QA_MCP_URL'] ?? '').trim();
+  const baseUrl = (fromCaller('baseUrl', 'x-qa-base-url') ?? process.env['QA_BASE_URL'] ?? '').trim();
   if (!url && !baseUrl) return null;
-  const productRaw = firstQuery(req, 'product') ?? firstHeader(req, 'x-qa-product') ?? process.env['QA_MCP_PROVIDER'] ?? '';
+  const productRaw = fromCaller('product', 'x-qa-product') ?? process.env['QA_MCP_PROVIDER'] ?? '';
   const product: 'walnut' | 'simplifyqa' = productRaw === 'simplifyqa' ? 'simplifyqa' : 'walnut';
   const projectId = (firstQuery(req, 'projectId') ?? firstHeader(req, 'x-project-id') ?? process.env['QA_MCP_PROJECT_ID'] ?? '').trim();
   const authRaw = firstQuery(req, 'auth') ?? firstHeader(req, 'x-qa-auth') ?? '';

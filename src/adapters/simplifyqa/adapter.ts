@@ -1,7 +1,7 @@
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, mkdir, writeFile } from 'node:fs/promises';
+import { join, parse as parsePath, resolve as resolvePath } from 'node:path';
 import type { ConnectedQaConfig } from '../../config.js';
 import type { MakeClientOptions, QaHttp } from '../http.js';
 import { ApiError, makeClient } from '../http.js';
@@ -29,11 +29,12 @@ import { apiFailureReason } from './apiFailureReason.js';
 import { buildDesktopConditionRows, seedDesktopConditionOperands } from './desktopConditions.js';
 import { apiTransportFailure, dbFailureHint, emptyReadWarning, unresolvedPlaceholders } from './stepDiagnostics.js';
 import { duplicateSteps } from '../../drafts/duplicate.js';
+import { CONDITION_KINDS, buildConditionRows, normalizeLoopKinds, stepConditions } from './loopConditions.js';
 import { mergeApiPatch } from '../../drafts/apiPatch.js';
 import { matchStepNumbers } from '../../drafts/bulk.js';
 import { resolveCollection } from './searchRegistry.js';
+import { mapLimit } from './mapLimit.js';
 import { ExecutionFailureAnalysis, fetchFailureImage } from './executionFailures.js';
-import { failureImages, renderExecution } from './failureReport.js';
 import { log } from '../../log.js';
 import type { HealApplyMode, HealPlan, HealProposeInput, HealReport } from '../../domain/heal.js';
 import { applyHealPlan as applyHealPlanCore, type HealApplyDeps, type HealTestDataPatch } from './heal/apply.js';
@@ -596,6 +597,91 @@ export type PlanEntryInput = { tcIds?: string[]; suiteIds?: string[]; assignTo?:
 /** One plan entry, as shown before removing it. */
 export type PlanEntryRef = { id: string; code: string; tcName: string; assignedTo?: number };
 
+/** What `task_create` takes. Only `name` and `estimatedEffort` are required; the rest is defaulted and reported. */
+export type TaskCreateInput = {
+  name: string; estimatedEffort: number; description?: string | undefined; type?: string | undefined; state?: string | undefined;
+  priority?: string | undefined; plannedStartDate?: string | undefined; plannedEndDate?: string | undefined; assignee?: string | undefined;
+  releaseId?: string | undefined; sprintId?: string | undefined; storyId?: string | undefined;
+};
+/** The created task as read back; `defaults` lists what the caller did not give and was filled in. */
+export type TaskCreateResult = {
+  id: string; code: string; name: string; type: string; state: string; priority: string; plannedStartDate: string; plannedEndDate: string;
+  estimatedEffort: number; ownerIds: number[]; release?: string; sprint?: string; storyId?: number; defaults: string[]; warnings: string[];
+};
+/** What `attachment_download` saved (`files`), or — when an item has several attachments and none was chosen — what it has (`available`,
+ *  with `needsChoice`). `sizeMatches` is null when SimplifyQA reports no size for the attachment. */
+export type AttachmentDownloadResult = {
+  files: Array<{ id: string; name: string; path: string; bytes: number; reportedBytes?: number; sizeMatches: boolean | null }>;
+  available: Array<{ id: string; name: string; bytes?: number }>;
+  needsChoice?: boolean;
+  warnings: string[];
+};
+/** What `backlog_unlink` removed: the link(s) as "DE-2293 (Clones)", and the links the source has left. */
+export type BacklogUnlinkResult = { sourceCode: string; destinationCode: string; removed: string[]; remaining: string[]; warnings: string[] };
+/** `defect_create`: log a defect by hand — what Defect Management → Create Defect takes. Only `name` is required; state / priority default to the
+ *  project's own defaults and the answer says so. */
+export type DefectCreateInput = {
+  name: string; description?: string | undefined; state?: string | undefined; priority?: string | undefined; severity?: string | undefined;
+  category?: string | undefined; assignee?: string | undefined; releaseId?: string | undefined; sprintId?: string | undefined; storyId?: string | undefined;
+  testCases?: string[] | undefined; module?: string | undefined; estimatedEffort?: number | undefined; customFields?: Record<string, unknown> | undefined;
+};
+export type DefectCreateResult = {
+  defectId: string; defectCode: string; name: string; state: string; priority: string; severity?: string; testCases: string[]; storyId?: number;
+  defaults: string[]; warnings: string[];
+};
+/** `defect_create_from_step`: the failed step of an execution report (`executionId` EX-170, `step` number, `tc` when the execution ran several
+ *  test cases) and what to call / set on the defect; everything else is pre-filled from the report. */
+export type DefectFromStepInput = {
+  executionId: string; step: number; tc?: string | undefined; name?: string | undefined; description?: string | undefined;
+  state?: string | undefined; priority?: string | undefined; severity?: string | undefined; assignee?: string | undefined;
+};
+export type DefectFromStepResult = {
+  defectId: string; defectCode: string; name: string; execution: string; testCase: string; step: number; attachments: number;
+  linkedToStep: boolean; state: string; priority: string; warnings: string[];
+};
+/** `defect_link_step`: link a failed step (and so its test case and execution) to an existing defect. */
+export type DefectLinkInput = { executionId: string; step: number; defectId: string; tc?: string | undefined };
+export type DefectLinkResult = {
+  defectCode: string; defectName: string; execution: string; testCase: string; step: number; stepLinked: boolean; testCaseLinked: boolean; warnings: string[];
+};
+/** What `defect_update` may change. `storyId` is the form's USER STORY field ("none" clears); `testCases` are added to the form's TEST CASE
+ *  field ("TC-41" or "TC-41:v1.0"), `removeTestCases` taken out, `clearTestCases` empties it. */
+export type DefectUpdateInput = {
+  storyId?: string | undefined; testCases?: string[] | undefined; removeTestCases?: string[] | undefined; clearTestCases?: boolean | undefined;
+  state?: string | undefined; priority?: string | undefined; severity?: string | undefined; name?: string | undefined; description?: string | undefined;
+  assignee?: string | undefined; unassign?: boolean | undefined; releaseId?: string | undefined; sprintId?: string | undefined;
+};
+/** The result of a defect update: each change as it read before and after; `written` is false when nothing needed changing. */
+export type DefectUpdateResult = { id: string; code: string; name: string; changes: Array<{ field: string; from: string; to: string }>; written: boolean; warnings: string[] };
+/** What `task_update` may change. `assignee` is a user id, email, name or "me"; `unassign` clears it. */
+export type TaskUpdateInput = {
+  name?: string | undefined; state?: string | undefined; priority?: string | undefined; description?: string | undefined;
+  plannedStartDate?: string | undefined; plannedEndDate?: string | undefined; estimatedEffort?: number | undefined;
+  assignee?: string | undefined; unassign?: boolean | undefined;
+  /** Release / sprint (id, code or exact name) and the linked user story (id or key); "none" clears each. */
+  releaseId?: string | undefined; sprintId?: string | undefined; storyId?: string | undefined;
+  actualEffort?: number | undefined; remainingEffort?: number | undefined;
+};
+/** The result of a task update: each change as it read before and after; `written` is false when nothing needed changing. */
+export type TaskUpdateResult = { id: string; code: string; name: string; changes: Array<{ field: string; from: string; to: string }>; written: boolean };
+/** What `release_create` / `sprint_create` take. `owners` are emails, names, user ids or "me" (default: the connected user). */
+export type PmCreateInput = {
+  name: string; plannedStartDate: string; plannedEndDate: string; estimatedEffort: number;
+  description?: string | undefined; state?: string | undefined; owners?: string[] | undefined; releaseId?: string | undefined;
+};
+/** The created release / sprint, as read back (`release` is the code of a sprint's release). */
+export type PmCreateResult = {
+  id: string; code: string; name: string; state: string; plannedStartDate: string; plannedEndDate: string; estimatedEffort: number;
+  ownerIds: number[]; release?: string; warnings: string[];
+};
+/** What `release_update` / `sprint_update` may change. `close` = the project's completed-type state + the actual end date. */
+export type PmUpdateInput = {
+  state?: string | undefined; close?: boolean | undefined; name?: string | undefined; description?: string | undefined;
+  plannedStartDate?: string | undefined; plannedEndDate?: string | undefined; actualStartDate?: string | undefined; actualEndDate?: string | undefined;
+  estimatedEffort?: number | undefined; ownerIds?: number[] | undefined;
+};
+/** The result of a release / sprint update: `written` is false when nothing needed changing. */
+export type PmUpdateResult = { id: string; code: string; name: string; stateBefore: string; stateAfter: string; changed: string[]; warnings: string[]; written: boolean };
 /** What a plan run started: the new execution id, the test cases sent, and those left out (with why). */
 export type PlanRunRef = { runId: string; started: string[]; skipped: Array<{ code: string; reason: string }> };
 /** Technologies the UI runs on their own technology "platform" (execution-popup-modal.component.ts:1209). */
@@ -646,24 +732,83 @@ const SCHEDULE_UPDATE_KEYS = [
 const RECURRENCE_KEYS = ['startDate', 'endDate', 'interval', 'daysOfWeek', 'dayOfMonth', 'occurencePosition'] as const;
 const WEEKDAYS = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
 
+type RecurrenceExtras = { interval?: number; daysOfWeek?: string[]; dayOfMonth?: number; occurrence?: string };
+/** The recurrence settings a caller gave (only the ones present). */
+function recurrenceExtras(o: RecurrenceExtras): RecurrenceExtras {
+  const out: RecurrenceExtras = {};
+  if (o.interval !== undefined) out.interval = o.interval;
+  if (o.daysOfWeek !== undefined) out.daysOfWeek = o.daysOfWeek;
+  if (o.dayOfMonth !== undefined) out.dayOfMonth = o.dayOfMonth;
+  if (o.occurrence !== undefined) out.occurrence = o.occurrence;
+  return out;
+}
+/** MONDAY / Mon / monday → MONDAY. */
+function sqaWeekday(v: string): string {
+  const hit = WEEKDAYS.find((d) => d.slice(0, 3) === String(v).trim().toUpperCase().slice(0, 3));
+  if (!hit || String(v).trim().length < 3) throw new Error(`"${v}" is not a weekday — use MONDAY … SUNDAY (or MON … SUN).`);
+  return hit;
+}
+/** The stored recurrence as the neutral cadence name. */
+function neutralCadence(doc: Record<string, any>): NonNullable<ScheduleOptions['scheduleType']> {
+  const t = String(doc['recurrenceType'] ?? 'ONCE').toLowerCase();
+  return (['once', 'every_5_minutes', 'hourly', 'daily', 'weekly', 'monthly'].includes(t) ? t : 'once') as NonNullable<ScheduleOptions['scheduleType']>;
+}
+
 /** SimplifyQA recurrence for a neutral cadence, as the scheduler form builds it. Day of week / month are
- *  taken in `timeZone` (the user's), so "weekly" from a Tuesday morning in India is a Tuesday. */
-function sqaRecurrence(type: ScheduleOptions['scheduleType'], start: string, end: string | null | undefined, timeZone: string) {
+ *  taken in `timeZone` (the user's), so "weekly" from a Tuesday morning in India is a Tuesday. The form's
+ *  "REPEAT EVERY N" is `interval`; weekly takes its days, monthly "ON DAY d" or "ON THE first/…/last <weekday>".
+ *  Settings a cadence does not have are refused, never dropped. */
+function sqaRecurrence(type: ScheduleOptions['scheduleType'], start: string, end: string | null | undefined, timeZone: string, extra: RecurrenceExtras = {}) {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'long', day: 'numeric' }).formatToParts(new Date(start));
   const weekday = (parts.find((p) => p.type === 'weekday')?.value ?? '').toUpperCase();
   const day = Number(parts.find((p) => p.type === 'day')?.value);
   const once = !type || type === 'once';
   const recurrenceType = once ? 'ONCE' : type === 'weekdays' ? 'WEEKLY' : type.toUpperCase();
+  const given = Object.keys(extra);
+  if (given.length) {
+    if (once) throw new Error(`A Once schedule has no recurrence settings (${given.join(', ')}) — pick hourly / daily / weekly / monthly.`);
+    if (type === 'every_5_minutes') {
+      throw new Error('Every 5 Minutes is fixed at 5 minutes — SimplifyQA has no other minute interval. For another cadence use hourly / daily / weekly / monthly with `interval` N (e.g. hourly, interval 2 = every 2 hours).');
+    }
+  }
+  let interval = 1;
+  if (extra.interval !== undefined) {
+    if (!Number.isInteger(extra.interval) || extra.interval < 1) throw new Error('interval must be a whole number, 1 or more (repeat every N hours / days / weeks / months).');
+    interval = extra.interval;
+  }
+  if (extra.daysOfWeek !== undefined && type === 'weekdays') throw new Error('weekdays already means Monday–Friday — use weekly with daysOfWeek for other days.');
+  if (extra.daysOfWeek !== undefined && type !== 'weekly' && !(type === 'monthly' && extra.occurrence !== undefined)) {
+    throw new Error('daysOfWeek applies to a weekly schedule (the days to run on) or a monthly one with `occurrence` (the weekday).');
+  }
+  if ((extra.dayOfMonth !== undefined || extra.occurrence !== undefined) && type !== 'monthly') throw new Error('dayOfMonth / occurrence apply to a monthly schedule only.');
+  let daysOfWeek: string[] = type === 'weekdays' ? WEEKDAYS.slice(1, 6) : type === 'weekly' ? [weekday] : [];
+  let dayOfMonth: number | null = type === 'monthly' && Number.isFinite(day) ? day : null;
+  let occurencePosition = '';
+  if (extra.daysOfWeek !== undefined) {
+    daysOfWeek = [...new Set(extra.daysOfWeek.map(sqaWeekday))];
+    if (!daysOfWeek.length) throw new Error('daysOfWeek needs at least one weekday.');
+  }
+  if (type === 'monthly') {
+    if (extra.occurrence !== undefined) {
+      if (extra.dayOfMonth !== undefined) throw new Error('A monthly schedule is either "on day D" (dayOfMonth) or "on the first / second / third / last <weekday>" (occurrence) — not both.');
+      if (daysOfWeek.length !== 1) throw new Error('"On the <first / second / third / last> …" needs exactly one weekday in daysOfWeek (e.g. ["MONDAY"]).');
+      occurencePosition = extra.occurrence.toUpperCase();
+      dayOfMonth = null;
+    } else if (extra.dayOfMonth !== undefined) {
+      if (!Number.isInteger(extra.dayOfMonth) || extra.dayOfMonth < 1 || extra.dayOfMonth > 30) throw new Error('dayOfMonth must be a whole number from 1 to 30 (the Scheduler form allows 30 at most).');
+      dayOfMonth = extra.dayOfMonth;
+    }
+  }
   return {
     recurrenceType,
     scheduleEndDate: once ? start : (end ?? null),
     reccurenceData: {
       startDate: start,
       endDate: once ? null : (end ?? null),
-      interval: 1,
-      daysOfWeek: type === 'weekdays' ? WEEKDAYS.slice(1, 6) : type === 'weekly' ? [weekday] : [],
-      dayOfMonth: type === 'monthly' && Number.isFinite(day) ? day : null,
-      occurencePosition: '',
+      interval,
+      daysOfWeek,
+      dayOfMonth,
+      occurencePosition,
     },
   };
 }
@@ -1878,6 +2023,994 @@ export class SimplifyQaAdapter {
     return withTotal(rows.map(toTaskSummary), raw);
   }
 
+  // ---------------------------------------------------------------------- Task update
+
+  /** One task as the backend stores it (`GET /pm/task/:id`), or undefined when there is none. */
+  private async readTaskDoc(id: number): Promise<Record<string, any> | undefined> {
+    const raw = await this.http.getJson<any>(`/pm/task/${id}`).catch(() => undefined);
+    let doc = raw?.data ?? raw;
+    if (Array.isArray(doc)) doc = doc[0];
+    return doc && typeof doc === 'object' && doc.id !== undefined ? doc : undefined;
+  }
+
+  /** The project's configured values of a default field of Task (parent 4) — `key` is what the row stores. Empty when they
+   *  cannot be read; the caller then passes the given value through and lets the backend decide. */
+  private async taskFieldValues(key: 'type' | 'state' | 'priority'): Promise<Array<{ key: string; value: string; isDefault?: boolean }>> {
+    try {
+      const raw = await this.http.getJson<any>(`/pm/fields/4?projectId=${this.requireProjectId()}&fieldType=defaultFld`);
+      const fields: any[] = Array.isArray(raw) ? raw : pickArray(raw, 'data', 'content', 'fields');
+      const field = fields.find((f) => f?.key === key);
+      return (Array.isArray(field?.values) ? field.values : [])
+        .filter((v: any) => v?.archive !== true)
+        .map((v: any) => ({ key: String(v?.key ?? v?.value ?? ''), value: String(v?.value ?? v?.key ?? ''), ...(v?.isDefault === true ? { isDefault: true } : {}) }))
+        .filter((v: { key: string }) => v.key);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Change a task the way the SimplifyQA editor does (a partial `PUT /pm/task/:id` carrying the project and the version it
+   *  read), then read it back and compare. The assignee may be a user id, email, name or "me"; `unassign` clears it. */
+  async updateTask(ref: string, patch: TaskUpdateInput): Promise<TaskUpdateResult> {
+    const projectId = this.requireProjectId();
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const raw = String(ref ?? '').trim();
+    if (!raw) throw new Error('task_update: say which task — its id, code (e.g. TA-3) or exact name.');
+
+    // 1. which task
+    let id: number | undefined;
+    if (/^\d+$/.test(raw)) id = Number.parseInt(raw, 10);
+    else {
+      const coded = /^[A-Za-z]{2,}[-_]\d+$/.test(raw);
+      const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const rows = coded
+        ? await this.listTasks({ filters: [{ column: 'code', value: raw.toUpperCase().replace('_', '-') }], limit: 5 })
+        : (await this.listTasks({ search: escaped, limit: 50 })).filter((r) => r.title.trim().toLowerCase() === raw.toLowerCase());
+      const label = (r: TaskSummary): string => `${r.code ?? `#${r.id}`} "${r.title}"`;
+      if (!rows.length) throw new Error(`No task "${raw}" in this project. Use task_list to find its id or code.`);
+      if (rows.length > 1) throw new Error(`"${raw}" matches ${rows.length} tasks (${rows.map(label).join('; ')}). Pass the id or code.`);
+      id = Number.parseInt(rows[0]!.id, 10);
+    }
+    const doc = id !== undefined && Number.isFinite(id) ? await this.readTaskDoc(id) : undefined;
+    if (!doc || (doc['projectId'] != null && Number(doc['projectId']) !== projectId) || doc['deleted'] === true) {
+      throw new Error(`No task "${raw}" in this project.`);
+    }
+    const taskId = Number(doc['id']);
+    const code = String(doc['code'] ?? `#${taskId}`);
+
+    // 2. what to change — only real differences, each checked before anything is sent
+    const changes: Record<string, unknown> = {};
+    const shown: Array<{ field: string; from: string; to: string }> = [];
+    const day = (v: unknown): string => (v == null || v === '' ? '(none)' : String(v).slice(0, 10));
+    const change = (field: string, key: string, to: unknown, from: string, toLabel: string): void => {
+      changes[key] = to;
+      shown.push({ field, from, to: toLabel });
+    };
+    const pickValue = async (key: 'state' | 'priority', want: string): Promise<string> => {
+      const values = await this.taskFieldValues(key);
+      if (!values.length) return want;
+      const hit = values.find((v) => canon(v.key) === canon(want) || canon(v.value) === canon(want));
+      if (!hit) throw new Error(`"${want}" is not a task ${key} in this project. Valid: ${values.map((v) => v.key).join(', ')}.`);
+      return hit.key;
+    };
+
+    if (patch.name !== undefined && patch.name.trim() !== String(doc['name'] ?? '')) {
+      if (patch.name.trim().length < 3) throw new Error('A task name needs at least 3 characters.');
+      change('name', 'name', patch.name.trim(), String(doc['name'] ?? ''), patch.name.trim());
+    }
+    if (patch.state !== undefined) {
+      const s = await pickValue('state', patch.state);
+      if (s !== doc['state']) change('state', 'state', s, String(doc['state'] ?? ''), s);
+    }
+    if (patch.priority !== undefined) {
+      const p = await pickValue('priority', patch.priority);
+      if (p !== doc['priority']) change('priority', 'priority', p, String(doc['priority'] ?? ''), p);
+    }
+    if (patch.description !== undefined && patch.description !== String(doc['description'] ?? '')) {
+      change('description', 'description', patch.description, '(previous)', '(updated)');
+    }
+    if (patch.estimatedEffort !== undefined && patch.estimatedEffort !== doc['estimatedEffort']) {
+      if (patch.estimatedEffort < 0 || patch.estimatedEffort > 9999) throw new Error('estimatedEffort must be between 0 and 9999.');
+      change('estimated effort', 'estimatedEffort', patch.estimatedEffort, String(doc['estimatedEffort'] ?? ''), String(patch.estimatedEffort));
+    }
+    for (const [field, key] of [['actual effort', 'actualEffort'], ['remaining effort', 'remainingEffort']] as const) {
+      const want = patch[key];
+      if (want === undefined) continue;
+      if (!Number.isFinite(want) || want < 0 || want > 9999) throw new Error(`${key} must be a number between 0 and 9999.`);
+      if (want !== doc[key]) change(field, key, want, String(doc[key] ?? ''), String(want));
+    }
+    // release / sprint / linked story: "none" clears; a sprint brings its release along
+    if (patch.releaseId !== undefined || patch.sprintId !== undefined) {
+      const plan = await this.resolveTaskPlanning(patch.releaseId, patch.sprintId);
+      const was = (k: string): string => String(doc[k] ?? '(none)');
+      let iterationId = plan.iterationId;
+      let sprintLabel = plan.sprintLabel;
+      // moving to another release must not leave the old release's sprint behind
+      if (patch.sprintId === undefined && plan.releaseId != null && plan.releaseId !== (doc['releaseId'] ?? null) && doc['iterationId'] != null) {
+        iterationId = null;
+        sprintLabel = 'none (it belonged to the old release)';
+      }
+      if (plan.releaseId !== undefined && plan.releaseId !== (doc['releaseId'] ?? null)) change('release', 'releaseId', plan.releaseId, was('releaseId'), plan.releaseLabel ?? 'none');
+      if (iterationId !== undefined && iterationId !== (doc['iterationId'] ?? null)) change('sprint', 'iterationId', iterationId, was('iterationId'), sprintLabel ?? 'none');
+    }
+    if (patch.storyId !== undefined) {
+      const clear = String(patch.storyId).trim().toLowerCase() === 'none';
+      const sid = clear ? null : Number.parseInt(await this.resolveStoryNumericId(String(patch.storyId)), 10);
+      if (sid !== (doc['userstoryId'] ?? null)) change('linked story', 'userstoryId', sid, String(doc['userstoryId'] ?? '(none)'), clear ? 'none' : String(patch.storyId));
+    }
+    for (const [field, key] of [['planned start', 'plannedStartDate'], ['planned end', 'plannedEndDate']] as const) {
+      const want = patch[key];
+      if (want === undefined) continue;
+      if (!/^\d{4}-\d{2}-\d{2}/.test(want) || Number.isNaN(new Date(want).getTime())) throw new Error(`${key} must be a date like 2026-11-17 (got "${want}").`);
+      if (day(doc[key]) !== day(want)) change(field, key, want, day(doc[key]), day(want));
+    }
+    const start = String(changes['plannedStartDate'] ?? doc['plannedStartDate'] ?? '');
+    const end = String(changes['plannedEndDate'] ?? doc['plannedEndDate'] ?? '');
+    if (start && end && new Date(end) < new Date(start) && ('plannedStartDate' in changes || 'plannedEndDate' in changes)) {
+      throw new Error(`The planned start (${day(start)}) would be after the planned end (${day(end)}). Move the end date too (plannedEndDate), or pick an earlier start.`);
+    }
+
+    let owners: number[] | undefined;
+    let ownerLabel = '';
+    if (patch.unassign) { owners = []; ownerLabel = 'Unassigned'; }
+    else if (patch.assignee !== undefined && String(patch.assignee).trim()) {
+      const who = String(patch.assignee).trim();
+      if (who.toLowerCase() === 'me') {
+        const me = await this.ensureUserId();
+        if (!me) throw new Error('Could not identify your user from the token, so "me" cannot be used. Pass an email or a user id.');
+        owners = [Number.parseInt(me, 10)];
+      } else {
+        owners = await this.resolveUserIds([who]);   // id, email or name — refuses one that matches nobody
+      }
+      ownerLabel = who;
+    }
+    if (owners) {
+      const current = (Array.isArray(doc['ownerId']) ? doc['ownerId'] : []).map(Number).sort((a: number, b: number) => a - b);
+      const wanted = [...owners].sort((a, b) => a - b);
+      if (JSON.stringify(current) !== JSON.stringify(wanted)) {
+        change('assignee', 'ownerId', owners, current.length ? current.map((n: number) => `user ${n}`).join(', ') : 'Unassigned', ownerLabel || owners.join(', '));
+      }
+    }
+
+    const name = String(doc['name'] ?? '');
+    if (!shown.length) return { id: String(taskId), code, name, changes: [], written: false };
+
+    // 3. save (a stale version is retried once with the fresh one) and read it back
+    const send = (d: Record<string, any>): Promise<unknown> =>
+      this.http.putJson<any>(`/pm/task/${taskId}`, { projectId, updateVersion: typeof d['updateVersion'] === 'number' ? d['updateVersion'] : 0, ...changes });
+    try {
+      try {
+        await send(doc);
+      } catch (e) {
+        if (!/CONCURRENCY/i.test(e instanceof Error ? e.message : String(e))) throw e;
+        await send((await this.readTaskDoc(taskId)) ?? doc);
+      }
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+        throw new Error(`Updating a task needs the "add_task" privilege in this project, and the connected user does not have it (${m}).`);
+      }
+      throw e;
+    }
+    const after = await this.readTaskDoc(taskId);
+    if (!after) throw new Error(`${code} was updated but could not be read back.`);
+    for (const k of Object.keys(changes)) {
+      const want = changes[k];
+      const got = after[k];
+      const same = k === 'ownerId'
+        ? JSON.stringify([...(Array.isArray(got) ? got : [])].map(Number).sort()) === JSON.stringify([...(want as number[])].sort())
+        : k === 'plannedStartDate' || k === 'plannedEndDate'
+          ? day(got) === day(want)
+          : String(got ?? '') === String(want ?? '');
+      if (!same) throw new Error(`${code}: "${k}" was sent as ${JSON.stringify(want)} but reads back as ${JSON.stringify(got)}.`);
+    }
+    return { id: String(taskId), code, name: String(after['name'] ?? name), changes: shown, written: true };
+  }
+
+  /** A task's release / sprint from what the caller said: "none" clears, a sprint brings its own release along, and a sprint that
+   *  belongs to a different release than the one named is refused. `releaseId` / `iterationId` are what the task stores. */
+  private async resolveTaskPlanning(releaseRef?: string, sprintRef?: string): Promise<{
+    releaseId?: number | null; iterationId?: number | null; releaseLabel?: string; sprintLabel?: string;
+  }> {
+    const none = (v?: string): boolean => String(v ?? '').trim().toLowerCase() === 'none';
+    const label = (r: any): string => `${r.code ?? `#${r.id}`} "${r.name ?? ''}"`;
+    const out: { releaseId?: number | null; iterationId?: number | null; releaseLabel?: string; sprintLabel?: string } = {};
+    let release: any;
+    if (releaseRef !== undefined) {
+      if (none(releaseRef)) { out.releaseId = null; out.releaseLabel = 'none'; if (sprintRef === undefined) { out.iterationId = null; out.sprintLabel = 'none'; } }
+      else { release = await this.findPm('release', releaseRef); out.releaseId = Number(release.id); out.releaseLabel = label(release); }
+    }
+    if (sprintRef !== undefined) {
+      if (none(sprintRef)) { out.iterationId = null; out.sprintLabel = 'none'; }
+      else {
+        if (releaseRef !== undefined && none(releaseRef)) throw new Error('A task cannot have a sprint without a release — clear the sprint too, or give the sprint\'s release.');
+        const sprint = await this.findPm('sprint', sprintRef);
+        if (release && String(sprint.releaseId) !== String(release.id)) {
+          throw new Error(`Sprint ${label(sprint)} belongs to release ${sprint.releaseId}, not ${label(release)}. Pick a sprint of that release.`);
+        }
+        out.iterationId = Number(sprint.id);
+        out.sprintLabel = label(sprint);
+        if (!release && sprint.releaseId != null) {
+          const own = (await this.pmRows('release')).find((r) => String(r.id) === String(sprint.releaseId));
+          out.releaseId = Number(sprint.releaseId);
+          out.releaseLabel = own ? label(own) : `#${sprint.releaseId}`;
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Create a task the way Tasks → Create Task does (`POST /pm/task`), then read it back. The backend requires a name, an
+   *  estimate, a type and both planned dates, and refuses a duplicate name in the project — and answers any failure with a
+   *  bare "Error While Creating Task" — so everything is checked here first. What the caller did not give is defaulted
+   *  (type / state / priority from the project's own default values; dates from the sprint, else the release, else today)
+   *  and the result says so. */
+  async createTask(input: TaskCreateInput): Promise<TaskCreateResult> {
+    const projectId = this.requireProjectId();
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const name = String(input.name ?? '').trim();
+    if (name.length < 2 || name.length > 500) throw new Error('A task name needs 2–500 characters.');
+    if (typeof input.estimatedEffort !== 'number' || !Number.isFinite(input.estimatedEffort) || input.estimatedEffort < 0 || input.estimatedEffort > 9999) {
+      throw new Error('task_create needs estimatedEffort — a number of hours between 0 and 9999.');
+    }
+    const defaults: string[] = [];
+    const warnings: string[] = [];
+
+    const plan = await this.resolveTaskPlanning(input.releaseId, input.sprintId);
+
+    // dates: given → used; else the sprint's, else the release's, else today
+    const dayOf = (v: unknown): string => String(v ?? '').slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+    let fallbackStart = today;
+    let fallbackEnd = today;
+    let from = 'today';
+    if (input.sprintId && plan.iterationId) {
+      const s = (await this.pmRows('sprint')).find((r) => String(r.id) === String(plan.iterationId));
+      if (s?.plannedStartDate && s?.plannedEndDate) { fallbackStart = dayOf(s.plannedStartDate); fallbackEnd = dayOf(s.plannedEndDate); from = `the sprint ${plan.sprintLabel}`; }
+    } else if (plan.releaseId) {
+      const r = (await this.pmRows('release')).find((x) => String(x.id) === String(plan.releaseId));
+      if (r?.plannedStartDate && r?.plannedEndDate) { fallbackStart = dayOf(r.plannedStartDate); fallbackEnd = dayOf(r.plannedEndDate); from = `the release ${plan.releaseLabel}`; }
+    }
+    const start = input.plannedStartDate ?? fallbackStart;
+    const end = input.plannedEndDate ?? (input.plannedStartDate && !input.plannedEndDate && fallbackEnd < input.plannedStartDate ? input.plannedStartDate : fallbackEnd);
+    for (const [k, v] of [['plannedStartDate', start], ['plannedEndDate', end]] as const) {
+      if (!/^\d{4}-\d{2}-\d{2}/.test(v) || Number.isNaN(new Date(v).getTime())) throw new Error(`${k} must be a date like 2026-11-17 (got "${v}").`);
+    }
+    if (new Date(end) < new Date(start)) throw new Error(`plannedEndDate (${dayOf(end)}) must be on or after plannedStartDate (${dayOf(start)}).`);
+    if (input.plannedStartDate === undefined || input.plannedEndDate === undefined) {
+      defaults.push(`planned dates ${dayOf(start)} → ${dayOf(end)} (${from === 'today' ? 'today' : `taken from ${from}`})`);
+    }
+
+    // type (required by the backend), state, priority: the project's own values
+    const pickValue = async (key: 'type' | 'state' | 'priority', want: string | undefined, required: boolean): Promise<string | undefined> => {
+      const values = await this.taskFieldValues(key);
+      if (want !== undefined) {
+        if (!values.length) return want;
+        const hit = values.find((v) => canon(v.key) === canon(want) || canon(v.value) === canon(want));
+        if (!hit) throw new Error(`"${want}" is not a task ${key} in this project. Valid: ${values.map((v) => v.key).join(', ')}.`);
+        return hit.key;
+      }
+      const dflt = values.find((v) => v.isDefault) ?? values[0];
+      if (dflt) { defaults.push(`${key} ${dflt.key}`); return dflt.key; }
+      if (required) throw new Error(`The project's task ${key} values could not be read, and ${key} is required — pass \`${key}\`.`);
+      return undefined;
+    };
+    const type = await pickValue('type', input.type, true);
+    const state = await pickValue('state', input.state, false);
+    const priority = await pickValue('priority', input.priority, false);
+
+    let ownerId: number[] | undefined;
+    if (input.assignee !== undefined && String(input.assignee).trim()) {
+      const who = String(input.assignee).trim();
+      if (who.toLowerCase() === 'me') {
+        const me = await this.ensureUserId();
+        if (!me) throw new Error('Could not identify your user from the token, so "me" cannot be used. Pass an email or a user id.');
+        ownerId = [Number.parseInt(me, 10)];
+      } else {
+        ownerId = await this.resolveUserIds([who]);
+      }
+    }
+    let userstoryId: number | undefined;
+    if (input.storyId !== undefined && String(input.storyId).trim()) userstoryId = Number.parseInt(await this.resolveStoryNumericId(String(input.storyId)), 10);
+
+    const clash = (await this.listTasks({ search: name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), limit: 50 })).find((t) => t.title.trim().toLowerCase() === name.toLowerCase());
+    if (clash) throw new Error(`A task named "${name}" already exists in this project: ${clash.code ?? `#${clash.id}`}. Use task_update to change it, or pick another name.`);
+
+    const body: Record<string, unknown> = {
+      projectId, name, type, plannedStartDate: start, plannedEndDate: end, estimatedEffort: input.estimatedEffort,
+      description: input.description ?? '',
+      ...(state ? { state } : {}), ...(priority ? { priority } : {}),
+      ...(ownerId ? { ownerId } : {}), ...(userstoryId !== undefined ? { userstoryId } : {}),
+      ...(plan.releaseId != null ? { releaseId: plan.releaseId } : {}), ...(plan.iterationId != null ? { iterationId: plan.iterationId } : {}),
+    };
+
+    let raw: any;
+    try {
+      raw = await this.http.postJson<any>('/pm/task', body);
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+        throw new Error(`Creating a task needs the "add_task" privilege in this project, and the connected user does not have it (${m}).`);
+      }
+      throw e;
+    }
+    const made = raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : raw;
+    const madeId = Number(made?.id);
+    const after = Number.isFinite(madeId) ? await this.readTaskDoc(madeId) : undefined;
+    if (!after) throw new Error(`The task "${name}" was sent, but it could not be read back.`);
+    if (String(after['name'] ?? '') !== name || Number(after['estimatedEffort']) !== input.estimatedEffort) {
+      throw new Error(`${after['code'] ?? `#${madeId}`}: it reads back as "${String(after['name'] ?? '')}" / effort ${String(after['estimatedEffort'])}, not what was sent.`);
+    }
+    if (ownerId && JSON.stringify([...(Array.isArray(after['ownerId']) ? after['ownerId'] : [])].map(Number).sort()) !== JSON.stringify([...ownerId].sort())) {
+      warnings.push(`The assignee did not read back as sent (${JSON.stringify(after['ownerId'])}).`);
+    }
+    return {
+      id: String(madeId), code: String(after['code'] ?? `#${madeId}`), name, type: String(after['type'] ?? type ?? ''), state: String(after['state'] ?? state ?? ''),
+      priority: String(after['priority'] ?? priority ?? ''), plannedStartDate: dayOf(start), plannedEndDate: dayOf(end), estimatedEffort: input.estimatedEffort,
+      ownerIds: ownerId ?? [], ...(plan.releaseLabel && plan.releaseId != null ? { release: plan.releaseLabel } : {}),
+      ...(plan.sprintLabel && plan.iterationId != null ? { sprint: plan.sprintLabel } : {}), ...(userstoryId !== undefined ? { storyId: userstoryId } : {}),
+      defaults, warnings,
+    };
+  }
+
+  // ---------------------------------------------------------------------- Defect update
+
+  /** The project's configured values of a default field of a backlog entity (parent 4 = Task, 9 = Defect) — `key` is what the row
+   *  stores. Empty when they cannot be read; the caller then passes the given value through. */
+  private async defaultFieldValues(parentId: number, key: string): Promise<Array<{ key: string; value: string; isDefault?: boolean }>> {
+    try {
+      const raw = await this.http.getJson<any>(`/pm/fields/${parentId}?projectId=${this.requireProjectId()}&fieldType=defaultFld`);
+      const fields: any[] = Array.isArray(raw) ? raw : pickArray(raw, 'data', 'content', 'fields');
+      const field = fields.find((f) => f?.key === key);
+      return (Array.isArray(field?.values) ? field.values : [])
+        .filter((v: any) => v?.archive !== true)
+        .map((v: any) => ({ key: String(v?.key ?? v?.value ?? ''), value: String(v?.value ?? v?.key ?? ''), ...(v?.isDefault === true ? { isDefault: true } : {}) }))
+        .filter((v: { key: string }) => v.key);
+    } catch {
+      return [];
+    }
+  }
+
+  /** A business code written with the other separator (US-25 / US_25) — tried second, since both appear in the product. */
+  private static codeVariants(ref: string): string[] {
+    const r = ref.trim();
+    const swapped = r.includes('-') ? r.replace('-', '_') : r.replace('_', '-');
+    return [...new Set([r, r.toUpperCase(), swapped, swapped.toUpperCase()])];
+  }
+
+  /** One defect of the active project as the backend stores it, by id, code (DE-61) or exact name. */
+  private async findDefectDoc(ref: string): Promise<Record<string, any>> {
+    const projectId = this.requireProjectId();
+    const raw = String(ref ?? '').trim();
+    if (!raw) throw new Error('defect_update: say which defect — its id, code (e.g. DE-61) or exact name.');
+    let id: number | undefined;
+    if (/^\d+$/.test(raw)) id = Number.parseInt(raw, 10);
+    else if (/^[A-Za-z]{2,}[-_]\d+$/.test(raw)) {
+      for (const code of SimplifyQaAdapter.codeVariants(raw)) {
+        const rows = await this.listDefects({ filters: [{ column: 'code', value: code }], limit: 5 });
+        if (rows.length) { id = Number.parseInt(rows[0]!.id, 10); break; }
+      }
+    } else {
+      const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const rows = (await this.listDefects({ search: escaped, limit: 50 })).filter((r) => r.title.trim().toLowerCase() === raw.toLowerCase());
+      if (rows.length > 1) throw new Error(`"${raw}" matches ${rows.length} defects (${rows.map((r) => `${r.code ?? `#${r.id}`}`).join(', ')}). Pass the id or code.`);
+      if (rows.length) id = Number.parseInt(rows[0]!.id, 10);
+    }
+    const doc = id !== undefined && Number.isFinite(id) ? await this.readDefectDoc(id) : undefined;
+    if (!doc || (doc['projectId'] != null && Number(doc['projectId']) !== projectId) || doc['deleted'] === true) {
+      throw new Error(`No defect "${raw}" in this project. Use sqa_query (collection "defects") to find its id or code.`);
+    }
+    return doc;
+  }
+
+  private async readDefectDoc(id: number): Promise<Record<string, any> | undefined> {
+    const raw = await this.http.getJson<any>(`/pm/defect/${id}`).catch(() => undefined);
+    let doc = raw?.data ?? raw;
+    if (Array.isArray(doc)) doc = doc[0];
+    return doc && typeof doc === 'object' && doc.id !== undefined ? doc : undefined;
+  }
+
+  /** A test case (id or code, optionally ":version" / "@version") as the defect form stores it in `selectedTestCase`. */
+  private async defectTestCaseEntry(ref: string): Promise<{ entry: Record<string, unknown>; label: string; tcId: number; versionNote?: string }> {
+    const projectId = this.requireProjectId();
+    const m = /^(.*?)[:@](.+)$/.exec(String(ref).trim());
+    const tcRef = (m ? m[1]! : String(ref)).trim();
+    const wantVersion = m ? m[2]!.trim() : undefined;
+    let tcId: number | undefined;
+    if (/^\d+$/.test(tcRef)) tcId = Number.parseInt(tcRef, 10);
+    else {
+      for (const code of SimplifyQaAdapter.codeVariants(tcRef)) {
+        const body = this.searchBody(
+          [{ column: 'code', value: code }, { column: 'projectId', value: projectId }, { column: 'deleted', value: false }],
+          { startIndex: 0, limit: 5, selectFields: ['id', 'code', 'name'] },
+        );
+        const rows = pickArray(await this.http.postJson<any>('/tm/testcase/search', body), 'data', 'content', 'testCases');
+        const hit = rows.find((r: any) => String(r?.code ?? '').toLowerCase() === code.toLowerCase());
+        if (hit) { tcId = Number.parseInt(str(hit, 'id', '_id') ?? '', 10); break; }
+      }
+    }
+    const raw = tcId !== undefined && Number.isFinite(tcId) ? await this.fetchRawTestcase(String(tcId)) : undefined;
+    if (!raw || raw['id'] === undefined || raw['deleted'] === true) throw new Error(`No test case "${tcRef}" in this project.`);
+    const versions: any[] = (Array.isArray(raw['versions']) ? raw['versions'] : []).filter((v) => v?.deleted !== true);
+    if (!versions.length) throw new Error(`Test case ${raw['code'] ?? tcRef} has no version to link.`);
+    let version: any;
+    let versionNote: string | undefined;
+    if (wantVersion) {
+      version = versions.find((v) => String(v?.name ?? '').trim().toLowerCase() === wantVersion.toLowerCase());
+      if (!version) throw new Error(`Test case ${raw['code'] ?? tcRef} has no version "${wantVersion}". Versions: ${versions.map((v) => v.name).join(', ')}.`);
+    } else {
+      const currentId = str(raw, 'versionId', 'selectedVersionId');
+      version = versions.find((v) => str(v, 'id', '_id') === currentId) ?? versions[versions.length - 1];
+      if (versions.length > 1) versionNote = `${raw['code'] ?? tcRef}: no version given, used ${version.name} (the test case has ${versions.map((v) => v.name).join(', ')}).`;
+    }
+    const code = String(raw['code'] ?? `#${raw['id']}`);
+    return {
+      entry: {
+        code, deleted: false, name: String(raw['name'] ?? ''), testcaseId: Number(raw['id']),
+        testcaseVersion: [{ deleted: false, version: Number(str(version, 'id', '_id') ?? 0) || str(version, 'id', '_id'), versionName: String(version.name ?? '') }],
+      },
+      label: `${code} (${String(version.name ?? '')})`,
+      tcId: Number(raw['id']),
+      ...(versionNote ? { versionNote } : {}),
+    };
+  }
+
+  /** Change a defect the way the SimplifyQA defect form does (a partial `PUT /pm/defect/:id` carrying the project and the version it
+   *  read), then read it back. USER STORY is `userstoryId`; TEST CASE is `selectedTestCase` — entries with the test case's id, code,
+   *  name and chosen version — which the backend also writes onto the test case's own linked-defects list; that last step swallows its
+   *  failures, so it is checked here (and redone through the same endpoint when missing). */
+  async updateDefect(ref: string, patch: DefectUpdateInput): Promise<DefectUpdateResult> {
+    const projectId = this.requireProjectId();
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const doc = await this.findDefectDoc(ref);
+    const defectId = Number(doc['id']);
+    const code = String(doc['code'] ?? `#${defectId}`);
+    const name = String(doc['name'] ?? '');
+    const changes: Record<string, unknown> = {};
+    const shown: Array<{ field: string; from: string; to: string }> = [];
+    const warnings: string[] = [];
+    const change = (field: string, key: string, to: unknown, from: string, toLabel: string): void => {
+      changes[key] = to;
+      shown.push({ field, from, to: toLabel });
+    };
+
+    // plain fields: the project's own values
+    for (const key of ['state', 'priority', 'severity'] as const) {
+      const want = patch[key];
+      if (want === undefined) continue;
+      const values = await this.defaultFieldValues(9, key);
+      let v = want;
+      if (values.length) {
+        const hit = values.find((x) => canon(x.key) === canon(want) || canon(x.value) === canon(want));
+        if (!hit) throw new Error(`"${want}" is not a defect ${key} in this project. Valid: ${values.map((x) => x.key).join(', ')}.`);
+        v = hit.key;
+      }
+      if (v !== doc[key]) change(key, key, v, String(doc[key] ?? '(none)'), v);
+    }
+    if (patch.name !== undefined && patch.name.trim() !== name) {
+      if (patch.name.trim().length < 3) throw new Error('A defect name needs at least 3 characters.');
+      change('name', 'name', patch.name.trim(), name, patch.name.trim());
+    }
+    if (patch.description !== undefined && patch.description !== String(doc['description'] ?? '')) change('description', 'description', patch.description, '(previous)', '(updated)');
+
+    // release / sprint
+    if (patch.releaseId !== undefined || patch.sprintId !== undefined) {
+      const plan = await this.resolveTaskPlanning(patch.releaseId, patch.sprintId);
+      let iterationId = plan.iterationId;
+      let sprintLabel = plan.sprintLabel;
+      if (patch.sprintId === undefined && plan.releaseId != null && plan.releaseId !== (doc['releaseId'] ?? null) && doc['iterationId'] != null) {
+        iterationId = null;
+        sprintLabel = 'none (it belonged to the old release)';
+      }
+      if (plan.releaseId !== undefined && plan.releaseId !== (doc['releaseId'] ?? null)) change('release', 'releaseId', plan.releaseId, String(doc['releaseId'] ?? '(none)'), plan.releaseLabel ?? 'none');
+      if (iterationId !== undefined && iterationId !== (doc['iterationId'] ?? null)) change('sprint', 'iterationId', iterationId, String(doc['iterationId'] ?? '(none)'), sprintLabel ?? 'none');
+    }
+
+    // assignee
+    let owners: number[] | undefined;
+    let ownerLabel = '';
+    if (patch.unassign) { owners = []; ownerLabel = 'Unassigned'; }
+    else if (patch.assignee !== undefined && String(patch.assignee).trim()) {
+      const who = String(patch.assignee).trim();
+      if (who.toLowerCase() === 'me') {
+        const me = await this.ensureUserId();
+        if (!me) throw new Error('Could not identify your user from the token, so "me" cannot be used. Pass an email or a user id.');
+        owners = [Number.parseInt(me, 10)];
+      } else {
+        owners = await this.resolveUserIds([who]);
+      }
+      ownerLabel = who;
+    }
+    if (owners) {
+      const current = (Array.isArray(doc['ownerId']) ? doc['ownerId'] : []).map(Number).sort((a: number, b: number) => a - b);
+      if (JSON.stringify(current) !== JSON.stringify([...owners].sort((a, b) => a - b))) {
+        change('assignee', 'ownerId', owners, current.length ? current.map((n: number) => `user ${n}`).join(', ') : 'Unassigned', ownerLabel || owners.join(', '));
+      }
+    }
+
+    // USER STORY field
+    if (patch.storyId !== undefined) {
+      const clear = String(patch.storyId).trim().toLowerCase() === 'none';
+      let sid: number | null = null;
+      if (!clear) {
+        let lastErr: unknown;
+        for (const v of SimplifyQaAdapter.codeVariants(String(patch.storyId))) {
+          try { sid = Number.parseInt(await this.resolveStoryNumericId(v), 10); break; } catch (e) { lastErr = e; }
+        }
+        if (sid === null || !Number.isFinite(sid)) throw new Error(`No user story "${patch.storyId}" (${lastErr instanceof Error ? lastErr.message : 'not found'}). Pass its id or business key.`);
+      }
+      if (sid !== (doc['userstoryId'] ?? null)) change('user story', 'userstoryId', sid, String(doc['userstoryId'] ?? '(none)'), clear ? 'none' : String(patch.storyId));
+    }
+
+    // TEST CASE field (selectedTestCase): add / replace per test case, remove, or clear
+    const label = (e: any): string => {
+      const v = Array.isArray(e?.testcaseVersion) ? e.testcaseVersion[0]?.versionName : undefined;
+      return `${e?.code ?? `#${e?.testcaseId ?? e}`}${v ? ` (${v})` : ''}`;
+    };
+    const currentTcs: any[] = Array.isArray(doc['selectedTestCase']) ? doc['selectedTestCase'] : [];
+    let nextTcs = [...currentTcs];
+    const added: Array<{ tcId: number; label: string }> = [];
+    if (patch.clearTestCases) nextTcs = [];
+    for (const r of patch.removeTestCases ?? []) {
+      const tcRef = String(r).split(/[:@]/)[0]!.trim();
+      const before = nextTcs.length;
+      nextTcs = nextTcs.filter((e) => ![String(e?.testcaseId), String(e?.code ?? '').toLowerCase()].some((k) => k === tcRef.toLowerCase() || k === tcRef));
+      if (nextTcs.length === before) warnings.push(`${tcRef} was not among this defect's test cases.`);
+    }
+    for (const r of patch.testCases ?? []) {
+      const e = await this.defectTestCaseEntry(r);
+      if (e.versionNote) warnings.push(e.versionNote);
+      const at = nextTcs.findIndex((x) => Number(x?.testcaseId) === e.tcId);
+      if (at >= 0) nextTcs[at] = e.entry; else nextTcs.push(e.entry);
+      added.push({ tcId: e.tcId, label: e.label });
+    }
+    const sig = (xs: any[]): string => JSON.stringify(xs.map((x) => [Number(x?.testcaseId), Number(x?.testcaseVersion?.[0]?.version ?? 0)]).sort());
+    if (sig(nextTcs) !== sig(currentTcs)) {
+      change('test case', 'selectedTestCase', nextTcs, currentTcs.length ? currentTcs.map(label).join(', ') : '(none)', nextTcs.length ? nextTcs.map(label).join(', ') : '(none)');
+      if ((patch.removeTestCases?.length || patch.clearTestCases) && !added.length) {
+        warnings.push('SimplifyQA does not remove the defect from the removed test case\'s own linked-defects list when it is unlinked here.');
+      }
+    }
+
+    if (!shown.length) return { id: String(defectId), code, name, changes: [], written: false, warnings };
+
+    // save (a stale version is retried once with the fresh one)
+    const send = (d: Record<string, any>): Promise<unknown> =>
+      this.http.putJson<any>(`/pm/defect/${defectId}`, { projectId, updateVersion: typeof d['updateVersion'] === 'number' ? d['updateVersion'] : 0, ...changes });
+    try {
+      try {
+        await send(doc);
+      } catch (e) {
+        if (!/CONCURRENCY/i.test(e instanceof Error ? e.message : String(e))) throw e;
+        await send((await this.readDefectDoc(defectId)) ?? doc);
+      }
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+        throw new Error(`Updating a defect needs the "add_defect" privilege in this project, and the connected user does not have it (${m}).`);
+      }
+      throw e;
+    }
+
+    // read the defect back and compare
+    const after = await this.readDefectDoc(defectId);
+    if (!after) throw new Error(`${code} was updated but could not be read back.`);
+    for (const k of Object.keys(changes)) {
+      const want = changes[k];
+      const got = after[k];
+      const same = k === 'ownerId'
+        ? JSON.stringify([...(Array.isArray(got) ? got : [])].map(Number).sort()) === JSON.stringify([...(want as number[])].sort())
+        : k === 'selectedTestCase'
+          ? sig(Array.isArray(got) ? got : []) === sig(want as any[])
+          : String(got ?? '') === String(want ?? '');
+      if (!same) throw new Error(`${code}: "${k}" was sent as ${JSON.stringify(want).slice(0, 200)} but reads back as ${JSON.stringify(got).slice(0, 200)}.`);
+    }
+
+    // the test case's own linked-defects list is written by the backend with its failures swallowed — check it, repair it, re-check
+    for (const t of added) {
+      const hasIt = async (): Promise<{ ok: boolean; ids: number[] }> => {
+        const raw = await this.fetchRawTestcase(String(t.tcId));
+        const ids = (Array.isArray(raw['defectId']) ? raw['defectId'] : []).map(Number);
+        return { ok: ids.includes(defectId), ids };
+      };
+      let state = await hasIt();
+      if (!state.ok) {
+        await this.http.putJson<any>(`/tm/testcase/bulkupdate/${t.tcId}`, { projectId, defectId: [...state.ids, defectId] }).catch(() => undefined);
+        state = await hasIt();
+      }
+      if (!state.ok) warnings.push(`${t.label}: the defect is saved with the test case, but the test case's own linked-defects list does not show ${code}.`);
+    }
+    return { id: String(defectId), code, name: String(after['name'] ?? name), changes: shown, written: true, warnings };
+  }
+
+  // ---------------------------------------------------------------------- Defect create
+
+  /** Log a defect the way Defect Management → Create Defect does (`POST /pm/defect`), then read it back. The backend requires a name,
+   *  state and priority — defaulted here from the project's own defaults when not given — refuses a duplicate name, and (for a defect not
+   *  logged from an execution) enforces the project's mandatory custom fields, which it reports in its own words. The User Story and
+   *  Test Case fields are set as the form stores them, and each test case is checked to list the defect. */
+  async createDefect(input: DefectCreateInput): Promise<DefectCreateResult> {
+    const projectId = this.requireProjectId();
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const name = String(input.name ?? '').trim();
+    if (name.length < 3 || name.length > 500) throw new Error('A defect name needs 3–500 characters.');
+    const warnings: string[] = [];
+    const defaults: string[] = [];
+
+    const clash = (await this.listDefects({ search: name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), limit: 50 })).find((d) => d.title.trim().toLowerCase() === name.toLowerCase());
+    if (clash) throw new Error(`A defect named "${name}" already exists in this project: ${clash.code ?? `#${clash.id}`}. Use defect_update to change it, or pick another name.`);
+
+    const pick = async (key: 'state' | 'priority' | 'severity' | 'category', want: string | undefined, required: boolean): Promise<string | undefined> => {
+      const values = await this.defaultFieldValues(9, key);
+      if (want !== undefined) {
+        if (!values.length) return want;
+        const hit = values.find((v) => canon(v.key) === canon(want) || canon(v.value) === canon(want));
+        if (!hit) throw new Error(`"${want}" is not a defect ${key} in this project. Valid: ${values.map((v) => v.key).join(', ')}.`);
+        return hit.key;
+      }
+      const dflt = values.find((v) => v.isDefault) ?? (required ? values[0] : undefined);
+      if (!dflt && required) throw new Error(`The project's defect ${key} values could not be read, and ${key} is required — pass \`${key}\`.`);
+      if (dflt && required) defaults.push(`${key} ${dflt.key}`);
+      return dflt?.key;
+    };
+    const state = await pick('state', input.state, true);
+    const priority = await pick('priority', input.priority, true);
+    const severity = await pick('severity', input.severity, false);
+    const category = await pick('category', input.category, false);
+
+    const plan = input.releaseId !== undefined || input.sprintId !== undefined ? await this.resolveTaskPlanning(input.releaseId, input.sprintId) : {};
+
+    let ownerId: number[] | undefined;
+    if (input.assignee !== undefined && String(input.assignee).trim()) {
+      const who = String(input.assignee).trim();
+      if (who.toLowerCase() === 'me') {
+        const me = await this.ensureUserId();
+        if (!me) throw new Error('Could not identify your user from the token, so "me" cannot be used. Pass an email or a user id.');
+        ownerId = [Number.parseInt(me, 10)];
+      } else {
+        ownerId = await this.resolveUserIds([who]);
+      }
+      if (ownerId.length !== 1) throw new Error('A defect has exactly one assignee when it is created.');
+    }
+
+    let userstoryId: number | undefined;
+    if (input.storyId !== undefined && String(input.storyId).trim()) {
+      let lastErr: unknown;
+      for (const v of SimplifyQaAdapter.codeVariants(String(input.storyId))) {
+        try { userstoryId = Number.parseInt(await this.resolveStoryNumericId(v), 10); break; } catch (e) { lastErr = e; }
+      }
+      if (userstoryId === undefined || !Number.isFinite(userstoryId)) throw new Error(`No user story "${input.storyId}" (${lastErr instanceof Error ? lastErr.message : 'not found'}). Pass its id or business key.`);
+    }
+
+    const tcEntries: Array<{ entry: Record<string, unknown>; label: string; tcId: number }> = [];
+    for (const r of input.testCases ?? []) {
+      const e = await this.defectTestCaseEntry(r);
+      if (e.versionNote) warnings.push(e.versionNote);
+      if (!tcEntries.some((x) => x.tcId === e.tcId)) tcEntries.push(e);
+    }
+
+    // the module: the caller's, else the project's "Default module" when it has one (the form's own default)
+    let moduleId: number | undefined;
+    if (input.module !== undefined && String(input.module).trim()) moduleId = await this.resolveModuleId(input.module);
+    else moduleId = await this.resolveModuleId('Default module').catch(() => undefined);
+    if (moduleId !== undefined && !Number.isFinite(moduleId)) moduleId = undefined;
+
+    const body: Record<string, unknown> = {
+      projectId, name, state, priority, description: input.description ?? '',
+      ...(severity ? { severity } : {}), ...(category ? { category } : {}),
+      ...(ownerId ? { ownerId } : {}),
+      ...(plan.releaseId != null ? { releaseId: plan.releaseId } : {}), ...(plan.iterationId != null ? { iterationId: plan.iterationId } : {}),
+      ...(userstoryId !== undefined ? { userstoryId } : {}),
+      ...(tcEntries.length ? { selectedTestCase: tcEntries.map((t) => t.entry) } : {}),
+      ...(moduleId ? { moduleId } : {}),
+      ...(input.estimatedEffort !== undefined ? { estimatedEffort: input.estimatedEffort } : {}),
+      customFields: input.customFields ?? {},
+    };
+
+    let raw: any;
+    try {
+      raw = await this.http.postJson<any>('/pm/defect', body);
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+        throw new Error(`Logging a defect needs the "add_defect" privilege in this project, and the connected user does not have it (${m}).`);
+      }
+      if (/mandatory|required.*custom|custom.*required/i.test(m)) {
+        throw new Error(`This project requires custom fields on a defect: ${m} Pass them as \`customFields\` ({ "<field key>": value }).`);
+      }
+      throw e;
+    }
+    const made = raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : raw;
+    const defectId = Number(made?.id);
+    const doc = Number.isFinite(defectId) ? await this.readDefectDoc(defectId) : undefined;
+    if (!doc) throw new Error(`The defect "${name}" was sent, but it could not be read back.`);
+    const defectCode = String(doc['code'] ?? `#${defectId}`);
+    if (String(doc['name'] ?? '') !== name) throw new Error(`${defectCode} reads back as "${String(doc['name'] ?? '')}", not "${name}".`);
+    if (userstoryId !== undefined && Number(doc['userstoryId']) !== userstoryId) warnings.push(`${defectCode}: the user story did not read back as sent (${String(doc['userstoryId'] ?? 'empty')}).`);
+    for (const t of tcEntries) {
+      if (!(await this.ensureTestCaseListsDefect(t.tcId, defectId).catch(() => false))) {
+        warnings.push(`${t.label}: the defect is saved with the test case, but the test case's own linked-defects list does not show ${defectCode}.`);
+      }
+    }
+    return {
+      defectId: String(defectId), defectCode, name, state: String(doc['state'] ?? state ?? ''), priority: String(doc['priority'] ?? priority ?? ''),
+      ...(severity ? { severity: String(doc['severity'] ?? severity) } : {}), testCases: tcEntries.map((t) => t.label),
+      ...(userstoryId !== undefined ? { storyId: userstoryId } : {}), defaults, warnings,
+    };
+  }
+
+  // ---------------------------------------------------------------------- Defects from a failed step
+
+  /** Make sure a test case's own linked-defects list shows the defect. The backend writes it when a defect is saved with the test case,
+   *  but swallows any failure — so check it, redo it through the same endpoint when missing, check again. */
+  private async ensureTestCaseListsDefect(tcId: number, defectId: number): Promise<boolean> {
+    const projectId = this.requireProjectId();
+    const read = async (): Promise<{ ok: boolean; ids: number[] }> => {
+      const raw = await this.fetchRawTestcase(String(tcId));
+      const ids = (Array.isArray(raw['defectId']) ? raw['defectId'] : []).map(Number);
+      return { ok: ids.includes(defectId), ids };
+    };
+    let state = await read();
+    if (!state.ok) {
+      await this.http.putJson<any>(`/tm/testcase/bulkupdate/${tcId}`, { projectId, defectId: [...state.ids, defectId] }).catch(() => undefined);
+      state = await read();
+    }
+    return state.ok;
+  }
+
+  /** The failed step an execution report shows — with its run, test case and version — found by execution id (EX-170), step number
+   *  and, for an execution of several test cases, the test case. Only a FAILED step can be logged / linked, as in the report. */
+  private async resolveFailedStep(executionRef: string, step: number, tcRef?: string): Promise<{
+    execId: number; execCode: string; execDoc: any; run: any; rows: any[]; row: any; error: string | undefined;
+    tcId: number; tcRaw: any; tcLabel: string; versionId: string; versionName: string;
+  }> {
+    const projectId = this.requireProjectId();
+    const execId = Number.parseInt(numericId(String(executionRef ?? '')), 10);
+    if (!Number.isFinite(execId)) throw new Error(`"${executionRef}" is not an execution id (e.g. EX-170 or 170).`);
+    if (!Number.isInteger(step) || step < 1) throw new Error('step must be the step number shown in the report (1, 2, 3 …).');
+    const execDoc = await this.fetchExecDoc(execId, projectId);
+    if (!execDoc) throw new Error(`No execution ${executionRef} in this project.`);
+    const execCode = String(execDoc.code ?? `EX-${execId}`);
+
+    const rawRuns = await this.http.getJson<any>(`/exec/report/${execId}/${projectId}`);
+    let runs: any[] = (Array.isArray(rawRuns) ? notDeleted(rawRuns) : []);
+    if (!runs.length) throw new Error(`${execCode} has no results yet — it may not have run.`);
+    const tcOf = (r: any): number => Number(str(r, 'testcaseId') ?? r?.executionItemId ?? execDoc.executionTypeId);
+    if (tcRef) {
+      let want: number | undefined = /^\d+$/.test(tcRef.trim()) ? Number.parseInt(tcRef.trim(), 10) : undefined;
+      if (want === undefined) {
+        for (const code of SimplifyQaAdapter.codeVariants(tcRef)) {
+          const body = this.searchBody([{ column: 'code', value: code }, { column: 'projectId', value: projectId }, { column: 'deleted', value: false }],
+            { startIndex: 0, limit: 5, selectFields: ['id', 'code'] });
+          const hit = pickArray(await this.http.postJson<any>('/tm/testcase/search', body), 'data', 'content', 'testCases')
+            .find((r: any) => String(r?.code ?? '').toLowerCase() === code.toLowerCase());
+          if (hit) { want = Number.parseInt(str(hit, 'id', '_id') ?? '', 10); break; }
+        }
+      }
+      runs = runs.filter((r) => tcOf(r) === want);
+      if (!runs.length) throw new Error(`${execCode} has no run of test case "${tcRef}".`);
+    }
+    if (runs.length > 1) {
+      throw new Error(`${execCode} ran ${runs.length} test cases (ids ${runs.map(tcOf).join(', ')}). Say which one with \`tc\`.`);
+    }
+    const run = runs[0];
+    const runId = str(run, 'id', '_id') ?? '';
+    const parentId = Number(run?.executionItemId ?? 0);
+    const resp = await this.http.postJson<any>('/reports/execution/getstepResult', { executionId: execId, executionRunId: runId, parentId, projectId });
+    const rows: any[] = Array.isArray(resp?.data) ? notDeleted(resp.data) : [];
+    const noise = new Set(['FUNCTION', 'FUNCTION_ITERATION_START', 'FUNCTION_ITERATION_END', 'FUNCTION_END', 'INFO']);
+    const candidates = rows.filter((r) => Number(r?.seq) === step && !noise.has(String(r?.stepType ?? '').toUpperCase()));
+    if (!candidates.length) {
+      const known = rows.filter((r) => !noise.has(String(r?.stepType ?? '').toUpperCase())).map((r) => `${r.seq}:${String(r.status ?? '').toLowerCase()}`).join(', ');
+      throw new Error(`${execCode} has no step ${step}. Steps: ${known || '(none)'}.`);
+    }
+    const row = candidates.find((r) => String(r?.status ?? '').toUpperCase() === 'FAILED');
+    if (!row) {
+      throw new Error(`Step ${step} of ${execCode} is ${String(candidates[0]?.status ?? 'not executed').toLowerCase()}, not failed — only a failed step can be logged or linked, as in the report.`);
+    }
+
+    const tcId = tcOf(run);
+    const tcRaw = await this.fetchRawTestcase(String(tcId));
+    if (!tcRaw || tcRaw['id'] === undefined) throw new Error(`The test case of ${execCode} (id ${tcId}) could not be read.`);
+    const versions: any[] = Array.isArray(tcRaw['versions']) ? tcRaw['versions'] : [];
+    const versionId = String(row.versionId ?? str(run, 'versionId') ?? '');
+    const version = versions.find((v) => str(v, 'id', '_id') === versionId);
+    const versionName = String(version?.name ?? versions[0]?.name ?? '');
+    const tcLabel = `${tcRaw['code'] ?? `#${tcId}`}${versionName ? ` (${versionName})` : ''}`;
+
+    // the report's own wording of why it failed (exception / ERROR log lines / API assertion), for the defect text
+    const mapped = await this.fetchStepResults(execId, runId, parentId, projectId).catch(() => []);
+    const error = mapped.find((m) => m.n === step && m.status === 'failed')?.error;
+    return { execId, execCode, execDoc, run, rows, row, error, tcId, tcRaw, tcLabel, versionId, versionName };
+  }
+
+  /** Add defect ids to a step result — the way the report's "link defect" does (`POST /exec/stepResult?from=reports` with the stored
+   *  step result). That save overwrites status, testdata, actualResult, screenShots and defectIds with what it is sent, so the stored
+   *  values go back unchanged, and the step is read again to prove nothing else moved. */
+  private async addDefectsToStep(execId: number, runId: string, parentId: number, row: Record<string, any>, defectIds: number[]): Promise<void> {
+    const projectId = this.requireProjectId();
+    const merged = [...new Set([...(Array.isArray(row['defectIds']) ? row['defectIds'] : []).map(Number), ...defectIds])];
+    // what must still be true afterwards — copied BEFORE the write, so a later change to the same objects cannot hide a difference
+    const before = JSON.parse(JSON.stringify({ status: row['status'] ?? null, testdata: row['testdata'] ?? null, actualResult: row['actualResult'] ?? null, screenShots: row['screenShots'] ?? null })) as Record<string, unknown>;
+    const doc: Record<string, any> = { ...row, defectIds: merged };
+    for (const k of ['_id', 'executionId', 'updatedAt', 'customerId', 'deleted', 'projectId', 'margin', 'attachments', 'children', 'createdAt',
+      'lineCount', 'technologyType', 'copiedBaseLinepath', 'copiedThumbnailpath', 'tempSubSteps', 'conditions']) delete doc[k];
+    await this.http.postJson<any>(`/exec/stepResult?executionId=${execId}&projectId=${projectId}&from=reports`, [doc]);
+
+    const resp = await this.http.postJson<any>('/reports/execution/getstepResult', { executionId: execId, executionRunId: runId, parentId, projectId });
+    const after: Record<string, any> | undefined = (Array.isArray(resp?.data) ? (notDeleted(resp.data) as any[]) : []).find((r: any) => r?.id === row['id']);
+    if (!after) throw new Error('The step result could not be read back after linking the defect.');
+    const got = (Array.isArray(after['defectIds']) ? after['defectIds'] : []).map(Number);
+    if (!defectIds.every((d) => got.includes(d))) throw new Error(`The step result reads back with defects ${JSON.stringify(got)}, not ${JSON.stringify(merged)}.`);
+    for (const k of ['status', 'testdata', 'actualResult', 'screenShots']) {
+      if (JSON.stringify(after[k] ?? null) !== JSON.stringify(before[k] ?? null)) {
+        throw new Error(`Linking the defect changed the step's ${k} — it does not read back as it was. Check the report before relying on it.`);
+      }
+    }
+  }
+
+  /** "Log Defect" on a failed step of an execution report: create the defect pre-filled with the test case + version, the steps to
+   *  replicate up to the failure, the execution, environment, browser, expected / actual and error, and the step's screenshots, then
+   *  link it to the step. */
+  async logDefectFromStep(input: DefectFromStepInput): Promise<DefectFromStepResult> {
+    const projectId = this.requireProjectId();
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const f = await this.resolveFailedStep(input.executionId, input.step, input.tc);
+    const warnings: string[] = [];
+    const esc = (v: unknown): string => String(v ?? '').replace(/<[^>]*>/g, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').trim();
+    const stepText = esc(f.row['description']) || `step ${input.step}`;
+
+    const name = (input.name ?? `${f.tcRaw['code'] ?? `TC-${f.tcId}`} step ${input.step} failed: ${stepText.slice(0, 80)} (${f.execCode})`).trim();
+    if (name.length < 3 || name.length > 500) throw new Error('A defect name needs 3–500 characters.');
+    const clash = (await this.listDefects({ search: name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), limit: 50 })).find((d) => d.title.trim().toLowerCase() === name.toLowerCase());
+    if (clash) {
+      throw new Error(`A defect named "${name}" already exists: ${clash.code ?? `#${clash.id}`}. If it is the same failure, link it with defect_link_step; otherwise pass a different \`name\`.`);
+    }
+    const already = (Array.isArray(f.row['defectIds']) ? f.row['defectIds'] : []).length;
+    if (already) warnings.push(`Step ${input.step} already has ${already} defect(s) linked; this one is added to them.`);
+
+    const pick = async (key: 'state' | 'priority' | 'severity', want: string | undefined, required: boolean): Promise<string | undefined> => {
+      const values = await this.defaultFieldValues(9, key);
+      if (want !== undefined) {
+        if (!values.length) return want;
+        const hit = values.find((v) => canon(v.key) === canon(want) || canon(v.value) === canon(want));
+        if (!hit) throw new Error(`"${want}" is not a defect ${key} in this project. Valid: ${values.map((v) => v.key).join(', ')}.`);
+        return hit.key;
+      }
+      const dflt = values.find((v) => v.isDefault) ?? (required ? values[0] : undefined);
+      if (!dflt && required) throw new Error(`The project's defect ${key} values could not be read, and ${key} is required — pass \`${key}\`.`);
+      return dflt?.key;
+    };
+    const state = await pick('state', input.state, true);
+    const priority = await pick('priority', input.priority, true);
+    const severity = await pick('severity', input.severity, false);
+
+    let ownerId: number[] | undefined;
+    if (input.assignee !== undefined && String(input.assignee).trim()) {
+      const who = String(input.assignee).trim();
+      if (who.toLowerCase() === 'me') {
+        const me = await this.ensureUserId();
+        if (!me) throw new Error('Could not identify your user from the token, so "me" cannot be used. Pass an email or a user id.');
+        ownerId = [Number.parseInt(me, 10)];
+      } else {
+        ownerId = await this.resolveUserIds([who]);
+      }
+      if (ownerId.length !== 1) throw new Error('A defect has exactly one assignee when it is created.');
+    }
+
+    // description: what the report writes (steps to replicate, up to the failed step) under a header with the evidence
+    const noise = new Set(['FUNCTION', 'FUNCTION_ITERATION_START', 'FUNCTION_ITERATION_END', 'FUNCTION_END', 'INFO']);
+    const usable = f.rows.filter((r) => !noise.has(String(r?.stepType ?? '').toUpperCase()));
+    const upTo: any[] = [];
+    for (const r of usable) { upTo.push(r); if (r.stepId === f.row['stepId'] && String(r.status).toUpperCase() === 'FAILED') break; }
+    const platform = Array.isArray(f.row['platform']) ? f.row['platform'][0] : undefined;
+    const browser = String(platform?.name ?? '').trim();
+    const environment = String(f.execDoc.environment ?? '').trim();
+    const expected = esc(f.row['expectedResult']);
+    const actual = esc(f.row['actualResult']);
+    const why = esc(f.error ?? f.row['exception']);
+    let html = `<strong>Logged from execution ${esc(f.execCode)}</strong><br>` +
+      `Test case: ${esc(f.tcLabel)} ${esc(f.tcRaw['name'])}<br>` +
+      `Failed step ${input.step}: ${stepText}<br>` +
+      (environment ? `Environment: ${esc(environment)}<br>` : '') + (browser ? `Browser: ${esc(browser)}<br>` : '') +
+      (expected ? `<strong>Expected:</strong> ${expected}<br>` : '') + (actual ? `<strong>Actual:</strong> ${actual}<br>` : '') +
+      (why ? `<strong>Error:</strong> ${why}<br>` : '') +
+      (input.description ? `<br>${esc(input.description)}<br>` : '') + '<br><strong>Steps to replicate:</strong><br>';
+    let j = 1;
+    for (const r of upTo) {
+      const status = String(r.status).toUpperCase();
+      const text = esc(r.description);
+      if ((status === 'PASSED' || status === 'FAILED') && text) {
+        html += `<span style="color:${status === 'PASSED' ? 'rgb(124,252,0)' : 'rgb(255,0,0)'};">[${status === 'PASSED' ? 'PASS' : 'FAIL'}]</span> ${j}. ${text}<br>`;
+        for (const td of Array.isArray(r.testdata) ? r.testdata : []) html += `<span style="color:rgb(0,0,0);">[TESTDATA]</span> : ${esc(td?.paramName)} = ${esc(td?.value)}<br>`;
+        j++;
+      }
+    }
+
+    const attachments = [
+      ...(Array.isArray(f.row['attachments']) ? f.row['attachments'] : []),
+      ...(Array.isArray(f.row['screenShots']) ? f.row['screenShots'] : []),
+    ];
+    if (!attachments.length) warnings.push('The failed step has no screenshot, so none is attached.');
+    const releaseId = Number(f.execDoc.releaseId) || undefined;
+    const iterationId = Number(f.execDoc.iterationId) || undefined;
+    const body: Record<string, unknown> = {
+      projectId, name, state, priority, description: html,
+      ...(severity ? { severity } : {}),
+      ...(ownerId ? { ownerId } : {}),
+      ...(releaseId ? { releaseId } : {}), ...(iterationId ? { iterationId } : {}),
+      ...(f.tcRaw['moduleId'] ? { moduleId: Number(f.tcRaw['moduleId']) } : {}),
+      attachments,
+      networkLogs: Array.isArray(f.row['networkLogs']) ? f.row['networkLogs'] : [],
+      selectedTestCase: [{
+        code: String(f.tcRaw['code'] ?? ''), deleted: false, name: String(f.tcRaw['name'] ?? ''), testcaseId: f.tcId,
+        testcaseVersion: [{ deleted: false, version: Number(f.versionId) || f.versionId, versionName: f.versionName }],
+      }],
+      fromExecution: true,
+    };
+
+    let raw: any;
+    try {
+      raw = await this.http.postJson<any>('/pm/defect', body);
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+        throw new Error(`Logging a defect needs the "add_defect" privilege in this project, and the connected user does not have it (${m}).`);
+      }
+      throw e;
+    }
+    const made = raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : raw;
+    const defectId = Number(made?.id);
+    const doc = Number.isFinite(defectId) ? await this.readDefectDoc(defectId) : undefined;
+    if (!doc) throw new Error(`The defect "${name}" was sent, but it could not be read back.`);
+    const defectCode = String(doc['code'] ?? `#${defectId}`);
+
+    // link it to the failed step, then make sure the test case lists it
+    const runId = str(f.run, 'id', '_id') ?? '';
+    let linkedToStep = false;
+    try {
+      await this.addDefectsToStep(f.execId, runId, Number(f.run?.executionItemId ?? 0), f.row, [defectId]);
+      linkedToStep = true;
+    } catch (e) {
+      warnings.push(`${defectCode} was created, but linking it to step ${input.step} failed: ${(e instanceof Error ? e.message : String(e)).replace(/\.$/, '')}. Use defect_link_step to retry.`);
+    }
+    if (!(await this.ensureTestCaseListsDefect(f.tcId, defectId).catch(() => false))) {
+      warnings.push(`${f.tcLabel}: the defect is saved with the test case, but the test case's own linked-defects list does not show ${defectCode}.`);
+    }
+    return {
+      defectId: String(defectId), defectCode, name, execution: f.execCode, testCase: f.tcLabel, step: input.step, attachments: attachments.length,
+      linkedToStep, state: String(doc['state'] ?? state ?? ''), priority: String(doc['priority'] ?? priority ?? ''), warnings,
+    };
+  }
+
+  /** Link a failed step to an EXISTING defect (DE-60): the defect id goes onto the step result (what the report shows), and the step's
+   *  test case + version is added to the defect's TEST CASE field so the link also shows from the defect and the test case. */
+  async linkDefectToStep(input: DefectLinkInput): Promise<DefectLinkResult> {
+    const f = await this.resolveFailedStep(input.executionId, input.step, input.tc);
+    const defect = await this.findDefectDoc(input.defectId);
+    const defectId = Number(defect['id']);
+    const defectCode = String(defect['code'] ?? `#${defectId}`);
+    const warnings: string[] = [];
+
+    const have = (Array.isArray(f.row['defectIds']) ? f.row['defectIds'] : []).map(Number);
+    let stepLinked = false;
+    if (!have.includes(defectId)) {
+      await this.addDefectsToStep(f.execId, str(f.run, 'id', '_id') ?? '', Number(f.run?.executionItemId ?? 0), f.row, [defectId]);
+      stepLinked = true;
+    }
+
+    const onDefect = (Array.isArray(defect['selectedTestCase']) ? defect['selectedTestCase'] : []).some((e: any) => Number(e?.testcaseId) === f.tcId);
+    let testCaseLinked = false;
+    if (!onDefect) {
+      const r = await this.updateDefect(String(defectId), { testCases: [f.versionName ? `${f.tcId}:${f.versionName}` : String(f.tcId)] });
+      warnings.push(...r.warnings);
+      testCaseLinked = r.written;
+    } else if (!(await this.ensureTestCaseListsDefect(f.tcId, defectId).catch(() => false))) {
+      warnings.push(`${f.tcLabel}: the test case's own linked-defects list does not show ${defectCode}.`);
+    }
+    return { defectCode, defectName: String(defect['name'] ?? ''), execution: f.execCode, testCase: f.tcLabel, step: input.step, stepLinked, testCaseLinked, warnings };
+  }
+
   // ---------------------------------------------------------------------- Backlog defaults
 
   /** Fetch the project's default `state` and `priority` for a backlog entity.
@@ -2041,6 +3174,84 @@ export class SimplifyQaAdapter {
     const raw = await this.http.getJson<any>(`/pm/attachment/${numericId(id)}/${spec.parentType}?projectId=${projectId}`);
     const rows = Array.isArray(raw) ? raw : pickArray(raw, 'data', 'content', 'attachments');
     return Array.isArray(rows) ? (rows as Array<Record<string, unknown>>).filter((a) => a?.['deleted'] !== true) : [];
+  }
+
+  /** Download attachments of an epic / feature / user story from SimplifyQA into a local folder. The file is fetched from the attachment's
+   *  `/download/…` URL through the SAME authenticated client the rest of the MCP uses (the user's token goes with the request — and only to the
+   *  connected SimplifyQA host). With one attachment and no choice it downloads it; with several and no choice it lists them instead
+   *  (`needsChoice`) so the caller can ask. Each saved file is compared with the size SimplifyQA reports, and a web page standing in for the file
+   *  (an expired login) is refused rather than saved as a "download". Never overwrites: a name that exists gets " (1)". */
+  async downloadAttachments(input: {
+    entityType: 'epic' | 'feature' | 'userstory';
+    itemId: string;
+    attachments?: string[] | undefined;
+    all?: boolean | undefined;
+    outDir: string;
+  }): Promise<AttachmentDownloadResult> {
+    if (!this.http.getBinary) throw new Error('This connection cannot download files.');
+    const base = (this.cfg.baseUrl ?? '').replace(/\/+$/, '');
+    const rows = await this.entityAttachments(input.entityType, input.itemId);
+    const nameOf = (a: Record<string, unknown>): string => String(a['original_name'] ?? a['name'] ?? '').trim();
+    const sizeOf = (a: Record<string, unknown>): number | undefined => {
+      const n = typeof a['size'] === 'number' ? (a['size'] as number) : Number(a['size'] ?? a['fileSize']);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
+    const available = rows.map((a) => ({ id: String(a['id'] ?? ''), name: nameOf(a), ...(sizeOf(a) !== undefined ? { bytes: sizeOf(a)! } : {}) }));
+    if (!rows.length) throw new Error(`${input.entityType} ${input.itemId} has no attachments.`);
+
+    let chosen: Array<Record<string, unknown>>;
+    if (input.all) chosen = rows;
+    else if (input.attachments?.length) {
+      chosen = [];
+      for (const ref of input.attachments) {
+        const want = String(ref).trim().toLowerCase();
+        const hits = rows.filter((a) => String(a['id'] ?? '').toLowerCase() === want || String(a['name'] ?? '').toLowerCase() === want || nameOf(a).toLowerCase() === want);
+        if (!hits.length) throw new Error(`${input.entityType} ${input.itemId} has no attachment "${ref}". It has: ${available.map((a) => a.name).join(', ')}.`);
+        if (hits.length > 1) throw new Error(`"${ref}" matches ${hits.length} attachments (ids ${hits.map((h) => String(h['id'])).join(', ')}) — pass the id.`);
+        if (!chosen.includes(hits[0]!)) chosen.push(hits[0]!);
+      }
+    } else if (rows.length === 1) chosen = rows;
+    else return { files: [], available, needsChoice: true, warnings: [] };
+
+    const dir = resolvePath(input.outDir);
+    await mkdir(dir, { recursive: true });
+    const files: AttachmentDownloadResult['files'] = [];
+    const warnings: string[] = [];
+    for (const a of chosen) {
+      const name = nameOf(a) || String(a['name'] ?? 'attachment');
+      const url = String(a['url'] ?? '').trim();
+      if (!url) throw new Error(`"${name}" has no download URL in SimplifyQA.`);
+      let path: string;
+      if (/^https?:\/\//i.test(url)) {
+        if (!base || !url.startsWith(`${base}/`)) throw new Error(`"${name}" points outside the connected SimplifyQA host (${url}) — not sending your token there.`);
+        path = url.slice(base.length);
+      } else path = url.startsWith('/') ? url : `/${url}`;
+      path = path.split('/').map((seg) => (/%[0-9A-Fa-f]{2}/.test(seg) ? seg : encodeURIComponent(seg))).join('/');
+
+      let res: { data: Uint8Array; contentType: string };
+      try {
+        res = await this.http.getBinary(path);
+      } catch (e) {
+        throw new Error(`Could not download "${name}": ${e instanceof Error ? e.message : String(e)}`);
+      }
+      const head = Buffer.from(res.data.subarray(0, 200)).toString('utf8').trimStart().toLowerCase();
+      const looksHtml = /text\/html/i.test(res.contentType) || head.startsWith('<!doctype html') || head.startsWith('<html');
+      if (looksHtml && !/\.(html?|svg)$/i.test(name)) {
+        throw new Error(`Downloading "${name}" returned a web page, not the file — the login may have expired. Reconnect (qa_connect) and try again.`);
+      }
+      if (res.data.byteLength === 0) throw new Error(`"${name}" downloaded empty (0 bytes) — nothing was saved.`);
+
+      const safeName = name.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').replace(/^\.+/, '').trim() || 'attachment';
+      const { name: stem, ext } = parsePath(safeName);
+      let target = join(dir, safeName);
+      for (let i = 1; await access(target).then(() => true, () => false); i++) target = join(dir, `${stem} (${i})${ext}`);
+      await writeFile(target, res.data);
+      const reported = sizeOf(a);
+      const sizeMatches = reported === undefined ? null : reported === res.data.byteLength;
+      if (sizeMatches === false) warnings.push(`"${name}": downloaded ${res.data.byteLength} bytes, but SimplifyQA reports ${reported} — the file may be incomplete or changed.`);
+      files.push({ id: String(a['id'] ?? ''), name, path: target, bytes: res.data.byteLength, ...(reported !== undefined ? { reportedBytes: reported } : {}), sizeMatches });
+    }
+    return { files, available, warnings };
   }
 
   /** Remove one attachment (by id or stored/original name) from an epic / feature / user story.
@@ -2599,6 +3810,252 @@ export class SimplifyQaAdapter {
     return { dryRun: false, deleted: true, dependencies: [], hasBlockers: false };
   }
 
+  // ---------------------------------------------------------------------- Release / sprint update
+
+  /** The keys the backend's release / sprint validators accept (project-management releaseValidation.js / sprintValidation.js).
+   *  The PUT validates the WHOLE body and refuses any other key (id, code, customerId, createdAt …), so only these are sent. */
+  private static readonly PM_FIELDS: Record<'release' | 'sprint', string[]> = {
+    release: ['name', 'plannedStartDate', 'state', 'plannedEndDate', 'estimatedEffort', 'projectIds', 'ownerIds', 'description',
+      'actualStartDate', 'actualEndDate', 'remainingEffort', 'actualEffort', 'customFields', 'azureReleaseId', 'jiraReleaseId'],
+    sprint: ['name', 'plannedStartDate', 'plannedEndDate', 'estimatedEffort', 'releaseId', 'state', 'ownerIds', 'description',
+      'actualStartDate', 'actualEndDate', 'actualEffort', 'remainingEffort', 'customFields', 'azureSprintPath', 'azureSprintId', 'jiraSprintId'],
+  };
+
+  /** Every live release (of the active project) or sprint (of its releases) as the backend stores it. */
+  private async pmRows(kind: 'release' | 'sprint'): Promise<any[]> {
+    const projectId = this.requireProjectId();
+    const fields: Array<{ column: string; value: any }> = [{ column: 'deleted', value: false }];
+    if (kind === 'release') fields.push({ column: 'projectIds', value: projectId });
+    const rows: any[] = [];
+    for (let startIndex = 0; startIndex < 2000; startIndex += 100) {
+      const raw = await this.http.postJson<any>(`/pm/${kind}/search`, this.searchBody(fields, { startIndex, limit: 100 }));
+      const page = pickArray(raw, 'data', 'content', kind === 'release' ? 'releases' : 'sprints');
+      rows.push(...page);
+      if (page.length < 100) break;
+    }
+    if (kind === 'release') return rows;
+    // a sprint row carries only its release — keep the ones of this project's releases
+    const mine = new Set((await this.pmRows('release')).map((r) => String(r?.id)));
+    return rows.filter((r) => r?.releaseId == null || mine.has(String(r.releaseId)));
+  }
+
+  /** One release / sprint by id, business code (RE-44) or exact name — never a guess when a name matches several. */
+  private async findPm(kind: 'release' | 'sprint', ref: string): Promise<any> {
+    const raw = String(ref ?? '').trim();
+    if (!raw) throw new Error(`${kind}: say which one — its id, code (e.g. ${kind === 'release' ? 'RE-44' : 'SP-3'}) or name.`);
+    const rows = await this.pmRows(kind);
+    const lower = raw.toLowerCase();
+    const byId = /^\d+$/.test(raw) ? rows.filter((r) => String(r.id) === raw) : [];
+    const byCode = rows.filter((r) => String(r.code ?? '').toLowerCase() === lower);
+    const byName = rows.filter((r) => String(r.name ?? '').trim().toLowerCase() === lower);
+    const hits = byId.length ? byId : byCode.length ? byCode : byName;
+    const label = (r: any): string => `${r.code ?? `#${r.id}`} "${r.name ?? ''}" [${r.state ?? ''}]`;
+    if (!hits.length) {
+      throw new Error(`No ${kind} "${raw}" in this project. ${rows.length ? `Known: ${rows.slice(0, 12).map(label).join('; ')}${rows.length > 12 ? '; …' : ''}.` : `The project has no ${kind}s.`}`);
+    }
+    if (hits.length > 1) throw new Error(`"${raw}" matches ${hits.length} ${kind}s (${hits.map(label).join('; ')}). Pass the id or code.`);
+    return hits[0];
+  }
+
+  /** The project's configured `state` values for releases (fields 11) or sprints (12): `key` is what the row stores. Empty when
+   *  they cannot be read — the caller then passes the given state through and lets the backend decide. */
+  private async pmStates(kind: 'release' | 'sprint'): Promise<Array<{ key: string; value: string }>> {
+    try {
+      const raw = await this.http.getJson<any>(`/pm/fields/${kind === 'release' ? 11 : 12}?projectId=${this.requireProjectId()}&fieldType=defaultFld`);
+      const fields: any[] = Array.isArray(raw) ? raw : pickArray(raw, 'data', 'content', 'fields');
+      const state = fields.find((f) => f?.key === 'state');
+      return (Array.isArray(state?.values) ? state.values : [])
+        .filter((v: any) => v?.archive !== true)
+        .map((v: any) => ({ key: String(v?.key ?? v?.value ?? ''), value: String(v?.value ?? v?.key ?? '') }))
+        .filter((v: { key: string }) => v.key);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Update a release or a sprint the way the SimplifyQA editor does (read it, change what was asked, PUT the whole record),
+   *  then read it back to confirm. `close` sets the project's completed-type state and the actual end date. */
+  async updateReleaseOrSprint(kind: 'release' | 'sprint', ref: string, patch: PmUpdateInput): Promise<PmUpdateResult> {
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const row = await this.findPm(kind, ref);
+    const states = await this.pmStates(kind);
+    const listing = states.map((s) => s.key).join(', ');
+    const pickState = (want: string): string => {
+      if (!states.length) return want;
+      const hit = states.find((s) => canon(s.key) === canon(want) || canon(s.value) === canon(want));
+      if (!hit) throw new Error(`"${want}" is not a ${kind} state in this project. Valid states: ${listing}.`);
+      return hit.key;
+    };
+    const closedState = (k: 'release' | 'sprint'): string | undefined => {
+      const order = k === 'release' ? ['completed', 'released', 'closed', 'done'] : ['completed', 'closed', 'done'];
+      for (const c of order) {
+        const hit = states.find((s) => canon(s.key) === c || canon(s.value) === c);
+        if (hit) return hit.key;
+      }
+      return undefined;
+    };
+
+    let newState: string | undefined;
+    if (patch.close) {
+      newState = closedState(kind) ?? (states.length ? undefined : 'Completed');
+      if (!newState) throw new Error(`This project's ${kind} states (${listing}) have no completed / closed one. Pass the state to use.`);
+    } else if (patch.state !== undefined) {
+      newState = pickState(patch.state);
+    }
+
+    const body: Record<string, unknown> = {};
+    for (const k of SimplifyQaAdapter.PM_FIELDS[kind]) if (row[k] !== undefined) body[k] = row[k];
+    // fields the validator takes only as a string / number: a stored null would be refused
+    if (body['description'] == null) body['description'] = '';
+    for (const k of ['azureSprintPath', 'azureSprintId']) if (typeof body[k] !== 'string') delete body[k];
+    body['updateVersion'] = typeof row.updateVersion === 'number' ? row.updateVersion : 0;
+
+    const changes: string[] = [];
+    const set = (k: string, v: unknown): void => { if (v !== undefined && JSON.stringify(body[k]) !== JSON.stringify(v)) { body[k] = v; changes.push(k); } };
+    if (newState !== undefined) set('state', newState);
+    set('name', patch.name);
+    set('plannedStartDate', patch.plannedStartDate);
+    set('plannedEndDate', patch.plannedEndDate);
+    set('actualStartDate', patch.actualStartDate);
+    set('actualEndDate', patch.actualEndDate);
+    set('description', patch.description);
+    set('estimatedEffort', patch.estimatedEffort);
+    set('ownerIds', patch.ownerIds);
+    if (patch.close && !body['actualEndDate']) { body['actualEndDate'] = new Date().toISOString(); changes.push('actualEndDate'); }
+    if (body['plannedStartDate'] && body['plannedEndDate'] && new Date(String(body['plannedEndDate'])) < new Date(String(body['plannedStartDate']))) {
+      throw new Error('plannedEndDate must be on or after plannedStartDate.');
+    }
+
+    const stateBefore = String(row.state ?? '');
+    const id = String(row.id);
+    const code = String(row.code ?? `#${id}`);
+    const warnings: string[] = [];
+    if (patch.close && kind === 'release') {
+      const done = closedState('sprint');
+      const open = (await this.pmRows('sprint').catch(() => []))
+        .filter((s) => String(s?.releaseId) === id && done && canon(String(s?.state ?? '')) !== canon(done));
+      if (open.length) warnings.push(`${open.length} sprint(s) of this release are not completed: ${open.map((s) => `${s.code ?? `#${s.id}`} [${s.state}]`).join(', ')}.`);
+    }
+    if (patch.close && kind === 'sprint') {
+      warnings.push('SimplifyQA\'s editor refuses to complete a sprint that still has new / pending stories, tasks or defects; this was not checked here.');
+    }
+    if (!changes.length) {
+      return { id, code, name: String(row.name ?? ''), stateBefore, stateAfter: stateBefore, changed: [], warnings, written: false };
+    }
+
+    try {
+      await this.http.putJson<any>(`/pm/${kind}/${id}`, body);
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDUSERTYPE|admin privileges|not.*authori[sz]ed|forbidden|\b40[13]\b/i.test(m)) {
+        throw new Error(`Updating a ${kind} needs an admin user in SimplifyQA, and the connected user is not one (${m}).`);
+      }
+      throw e;
+    }
+
+    // Read it back — the update only counts when the stored record shows it.
+    const after = (await this.pmRows(kind)).find((r) => String(r.id) === id);
+    if (!after) throw new Error(`${code} was updated but could not be read back.`);
+    if (newState !== undefined && canon(String(after.state ?? '')) !== canon(newState)) {
+      throw new Error(`${code} was sent state "${newState}" but reads back "${String(after.state ?? '')}".`);
+    }
+    return { id, code, name: String(after.name ?? row.name ?? ''), stateBefore, stateAfter: String(after.state ?? ''), changed: changes, warnings, written: true };
+  }
+
+  /** Create a release or a sprint the way Releases → Create does (`POST /pm/release` / `/pm/sprint`), then read it back.
+   *  The backend requires a state and at least one owner, so the state defaults to the project's first one (New) and the owner to
+   *  the connected user. A sprint needs an existing release of this project. */
+  async createReleaseOrSprint(kind: 'release' | 'sprint', input: PmCreateInput): Promise<PmCreateResult> {
+    const projectId = this.requireProjectId();
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const name = String(input.name ?? '').trim();
+    if (name.length < 3 || name.length > 500) throw new Error(`A ${kind} name needs 3–500 characters.`);
+    for (const k of ['plannedStartDate', 'plannedEndDate'] as const) {
+      const v = input[k];
+      if (!v) throw new Error(`${kind}_create needs ${k} (YYYY-MM-DD).`);
+      if (!/^\d{4}-\d{2}-\d{2}/.test(v) || Number.isNaN(new Date(v).getTime())) throw new Error(`${k} must be a date like 2026-11-16 (got "${v}").`);
+    }
+    if (new Date(input.plannedEndDate) < new Date(input.plannedStartDate)) throw new Error('plannedEndDate must be on or after plannedStartDate.');
+    if (typeof input.estimatedEffort !== 'number' || !Number.isFinite(input.estimatedEffort) || input.estimatedEffort < 0) {
+      throw new Error(`${kind}_create needs estimatedEffort — a number of hours, 0 or more.`);
+    }
+
+    let release: any;
+    if (kind === 'sprint') {
+      if (!input.releaseId) throw new Error('sprint_create needs releaseId — the release it belongs to (id, code like RE-44, or exact name).');
+      release = await this.findPm('release', input.releaseId);
+    }
+    const dup = (await this.pmRows(kind)).find((r) => String(r.name ?? '').trim().toLowerCase() === name.toLowerCase()
+      && (kind === 'release' || String(r.releaseId) === String(release.id)));
+    if (dup) {
+      throw new Error(`A ${kind} named "${name}" already exists${kind === 'sprint' ? ' in that release' : ''}: ${dup.code ?? `#${dup.id}`} [${dup.state ?? ''}]. ` +
+        `Use ${kind}_update to change it, or pick another name.`);
+    }
+
+    const states = await this.pmStates(kind);
+    let state: string;
+    if (input.state) {
+      const hit = states.find((s) => canon(s.key) === canon(input.state!) || canon(s.value) === canon(input.state!));
+      if (states.length && !hit) throw new Error(`"${input.state}" is not a ${kind} state in this project. Valid states: ${states.map((s) => s.key).join(', ')}.`);
+      state = hit?.key ?? input.state;
+    } else {
+      state = states.find((s) => canon(s.key) === 'new')?.key ?? states[0]?.key ?? 'New';
+    }
+
+    const me = await this.ensureUserId();
+    const refs = input.owners?.length ? input.owners : ['me'];
+    const ownerIds: number[] = [];
+    for (const ref of refs) {
+      if (String(ref).trim().toLowerCase() === 'me') {
+        if (!me) throw new Error('Could not identify your user from the token, so "me" cannot be the owner. Pass owners (an email, name or user id).');
+        ownerIds.push(Number.parseInt(me, 10));
+      } else {
+        ownerIds.push(...await this.resolveUserIds([ref]));
+      }
+    }
+    const owners = [...new Set(ownerIds)];
+
+    const body: Record<string, unknown> = {
+      name, state, ownerIds: owners, description: input.description ?? '',
+      plannedStartDate: input.plannedStartDate, plannedEndDate: input.plannedEndDate, estimatedEffort: input.estimatedEffort,
+      ...(kind === 'release' ? { projectIds: [projectId] } : { releaseId: Number(release.id) }),
+    };
+
+    let raw: any;
+    try {
+      raw = await this.http.postJson<any>(`/pm/${kind}`, body);
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDUSERTYPE|admin privileges|not.*authori[sz]ed|forbidden|\b40[13]\b/i.test(m)) {
+        throw new Error(`Creating a ${kind} needs an admin user in SimplifyQA, and the connected user is not one (${m}).`);
+      }
+      throw e;
+    }
+    const made = raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : raw;
+
+    // Read it back — it only counts when the stored record shows it.
+    const rows = await this.pmRows(kind);
+    const after = rows.find((r) => made?.id !== undefined && String(r.id) === String(made.id))
+      ?? rows.filter((r) => String(r.name ?? '').trim().toLowerCase() === name.toLowerCase()).pop();
+    if (!after) throw new Error(`The ${kind} "${name}" was sent, but it was not found when read back.`);
+    if (after.estimatedEffort !== undefined && Number(after.estimatedEffort) !== input.estimatedEffort) {
+      throw new Error(`${after.code ?? `#${after.id}`}: estimatedEffort was sent as ${input.estimatedEffort} but reads back as ${after.estimatedEffort}.`);
+    }
+
+    const warnings: string[] = [];
+    if (kind === 'sprint') {
+      const d = (v: unknown): string => String(v ?? '').slice(0, 10);
+      if (release.plannedStartDate && d(input.plannedStartDate) < d(release.plannedStartDate)) warnings.push(`The sprint starts (${d(input.plannedStartDate)}) before its release does (${d(release.plannedStartDate)}).`);
+      if (release.plannedEndDate && d(input.plannedEndDate) > d(release.plannedEndDate)) warnings.push(`The sprint ends (${d(input.plannedEndDate)}) after its release does (${d(release.plannedEndDate)}).`);
+    }
+    return {
+      id: String(after.id), code: String(after.code ?? `#${after.id}`), name: String(after.name ?? name), state: String(after.state ?? state),
+      plannedStartDate: String(input.plannedStartDate).slice(0, 10), plannedEndDate: String(input.plannedEndDate).slice(0, 10),
+      estimatedEffort: input.estimatedEffort, ownerIds: owners,
+      ...(kind === 'sprint' ? { release: String(release.code ?? `#${release.id}`) } : {}), warnings,
+    };
+  }
+
   /** `list_releases` has no limit/offset of its own — it always wants the WHOLE visible set — so
    *  page internally past `searchBody`'s default 100 instead of silently truncating (same fix as
    *  listModules). */
@@ -2854,6 +4311,111 @@ export class SimplifyQaAdapter {
       );
     }
     return { linkTypeKey: chosen.key, ...(dest.code ? { destinationCode: dest.code } : {}), linkedIssues: links };
+  }
+
+  /** Remove a link between two backlog items — the UI's Linkages delete. The link is a row stored on the SOURCE item and mirrored on the
+   *  destination under the SAME id; the backend removes it when the source is saved with that row marked `deleted:true`, which drops both sides.
+   *  The row is the stored one (it must carry its destination code, or the backend errors), the removal is read back from /pm/linkages, and the
+   *  other side is checked too. With several links to the same item, `linkType` says which one. */
+  async unlinkBacklogItem(input: {
+    sourceType: 'epic' | 'feature' | 'userstory' | 'defect' | 'task';
+    sourceId: string;
+    destType: 'epic' | 'feature' | 'userstory' | 'defect' | 'task';
+    destId: string;
+    linkType?: string | undefined;
+  }): Promise<BacklogUnlinkResult> {
+    const specs = {
+      epic: { path: '/pm/epic', search: '/pm/epic/search', parentType: 'EP' },
+      feature: { path: '/pm/feature', search: '/pm/feature/search', parentType: 'FT' },
+      userstory: { path: '/pm/userstory', search: '/pm/userstory/search', parentType: 'US' },
+      defect: { path: '/pm/defect', search: '/pm/defect/search', parentType: 'DE' },
+      task: { path: '/pm/task', search: '/pm/task/search', parentType: 'TA' },
+    } as const;
+    const projectId = this.requireProjectId();
+    const asDoc = (raw: any): Record<string, any> => (Array.isArray(raw) ? (raw[0] ?? {}) : (raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : raw)) ?? {};
+    const refOf = async (type: keyof typeof specs, ref: string): Promise<{ id: number; code?: string; name?: string }> => {
+      const spec = specs[type];
+      const bare = numericId(ref);
+      if (/^\d+$/.test(String(bare))) {
+        try {
+          const doc = asDoc(await this.http.getJson<any>(`${spec.path}/${bare}`));
+          const id = Number.parseInt(str(doc, 'id', '_id') ?? String(bare), 10);
+          if (Number.isFinite(id)) return { id, ...(str(doc, 'code') ? { code: str(doc, 'code')! } : {}), ...(str(doc, 'name') ? { name: str(doc, 'name')! } : {}) };
+        } catch { /* fall through to search */ }
+      }
+      for (const column of ['code', 'name'] as const) {
+        const raw = await this.http.postJson<any>(spec.search, this.searchBody([{ column, value: ref }], { startIndex: 0, limit: 20, selectFields: ['id', 'code', 'name'] }));
+        const hit = pickArray(raw, 'data', 'content').find((r: any) => String(str(r, column) ?? '').trim().toLowerCase() === ref.trim().toLowerCase());
+        const id = hit ? Number.parseInt(str(hit, 'id', '_id') ?? '', 10) : NaN;
+        if (Number.isFinite(id)) return { id, ...(str(hit, 'code') ? { code: str(hit, 'code')! } : {}), ...(str(hit, 'name') ? { name: str(hit, 'name')! } : {}) };
+      }
+      throw new Error(`${type} "${ref}" was not found in this project.`);
+    };
+    const readLinks = async (id: number, parentType: string): Promise<Array<Record<string, any>>> => {
+      const raw = await this.http.getJson<any>(`/pm/linkages/${id}/${parentType}?projectId=${projectId}`);
+      return (Array.isArray(raw) ? raw : pickArray(raw, 'data', 'content', 'linkages')) as Array<Record<string, any>>;
+    };
+    const label = (l: Record<string, any>): string => `${l['destinationCode'] ?? l['destinationId']} (${l['linkTypeKey']})`;
+
+    const source = await refOf(input.sourceType, input.sourceId);
+    const dest = await refOf(input.destType, input.destId);
+    const sourceName = source.code ?? input.sourceId;
+    const destName = dest.code ?? input.destId;
+    const links = await readLinks(source.id, specs[input.sourceType].parentType);
+
+    // which link(s): to that item, and — when asked — of that type (by its key, or by the name the UI shows)
+    let matches = links.filter((l) => Number(l['destinationId']) === dest.id);
+    const want = input.linkType?.trim().toLowerCase();
+    if (want) {
+      let narrowed = matches.filter((l) => String(l['linkTypeKey']).toLowerCase() === want);
+      if (!narrowed.length && matches.length) {
+        // the name the dropdown shows → its key, from the same catalogue backlog_link reads
+        const rawTypes = await this.http.getJson<any>(`/pm/fields/10?projectId=${projectId}&fieldType=linkages`).catch(() => undefined);
+        const keys = new Set<string>();
+        const typeRows = new Set<string>();   // the catalogue row either of whose names was given — both sides are the same link type
+        for (const row of (Array.isArray(rawTypes) ? rawTypes : pickArray(rawTypes, 'data', 'content', 'fields')) as any[]) {
+          for (const side of ['inwardType', 'outwardType'] as const) {
+            const t = row?.[side];
+            if (t && typeof t === 'object' && [str(t, 'value'), str(t, 'label'), str(t, 'name')].some((v) => (v ?? '').trim().toLowerCase() === want)) {
+              keys.add((str(t, 'key') ?? '').toLowerCase());
+              if (row?.id !== undefined) typeRows.add(String(row.id));
+            }
+          }
+        }
+        narrowed = matches.filter((l) => keys.has(String(l['linkTypeKey']).toLowerCase()) || typeRows.has(String(l['linkId'])));
+      }
+      matches = narrowed;
+    }
+    if (!matches.length) {
+      throw new Error(`${sourceName} has no link to ${destName}${input.linkType ? ` of type "${input.linkType}"` : ''}. Its links: ${links.map(label).join(', ') || '(none)'}.`);
+    }
+    const types = [...new Set(matches.map((l) => String(l['linkTypeKey'])))];
+    if (!want && types.length > 1) {
+      throw new Error(`${sourceName} has ${matches.length} links to ${destName} (${types.join(', ')}) — say which one to remove with \`linkType\`.`);
+    }
+
+    // save the source with each stored row marked deleted (the backend skips rows without `deleted`, and needs their destinationCode)
+    const entries = matches.map((m) => ({ ...m, deleted: true }));
+    const ids = new Set(matches.map((m) => String(m['id'])));
+    const sourceDoc = asDoc(await this.http.getJson<any>(`${specs[input.sourceType].path}/${source.id}`));
+    const version = typeof sourceDoc['updateVersion'] === 'number' ? sourceDoc['updateVersion'] : 0;
+    if (input.sourceType === 'epic') await this.updateEpic(String(source.id), { linkedIssues: entries, updateVersion: version });
+    else if (input.sourceType === 'feature') await this.updateFeature(String(source.id), { linkedIssues: entries, updateVersion: version });
+    else if (input.sourceType === 'userstory') await this.updateStory(String(source.id), { linkedIssues: entries });
+    else await this.http.putJson<any>(`${specs[input.sourceType].path}/${source.id}`, { projectId, linkedIssues: entries, updateVersion: version });
+
+    // read it back — from the source, and from the other side
+    const after = await readLinks(source.id, specs[input.sourceType].parentType);
+    if (after.some((l) => ids.has(String(l['id'])))) {
+      throw new Error(`Asked to remove the link ${sourceName} → ${destName}, but the Linkages still show it. Links now: ${after.map(label).join(', ') || '(none)'}`);
+    }
+    const warnings: string[] = [];
+    const destParent = (dest.code ?? '').split('-')[0] || specs[input.destType].parentType;
+    const mirror = await readLinks(dest.id, destParent).catch(() => undefined);
+    if (mirror?.some((l) => ids.has(String(l['id'])))) {
+      warnings.push(`${destName}'s own Linkages still show the link back to ${sourceName} — the other side did not clear.`);
+    }
+    return { sourceCode: sourceName, destinationCode: destName, removed: matches.map(label), remaining: after.map(label), warnings };
   }
 
   /** Create a PROJECT (`POST /pm/project`). The UI's new-project form sends a name, description and
@@ -4541,6 +6103,17 @@ export class SimplifyQaAdapter {
       if (names.length > (st.runtimeParameters?.length ?? 0)) st.runtimeParameters = names;
     }
     const allRuntimeNames = new Set([...slotNamesByStep.values()].flat());
+    // Every parameter this save has to bind is collected first (same precedence order as before —
+    // first occurrence wins) and then resolved with bounded concurrency. A recording save used to
+    // spend one round-trip per token (search + maybe create), one AFTER another: with 10+ steps that
+    // was the bulk of the post-recording wait in the client. Different names are independent.
+    const pendingParams: Array<{ name: string; value: string; access: 'Local' | 'Runtime' }> = [];
+    const queuedParams = new Set<string>();
+    const queueParam = (name: string, value: string, access: 'Local' | 'Runtime'): void => {
+      if (paramIdByName.has(name) || queuedParams.has(name)) return;
+      queuedParams.add(name);
+      pendingParams.push({ name, value, access });
+    };
     for (const s of steps) {
       // Replace-a-parameter edits: the NEW parameter is get-or-create; the OLD one must already exist (a name or an id) —
       // never create a parameter just to remove it, and never guess.
@@ -4566,18 +6139,17 @@ export class SimplifyQaAdapter {
         }
       }
       for (const name of extractParamNames(s.description)) {
-        if (paramIdByName.has(name)) continue;
+        if (paramIdByName.has(name) || queuedParams.has(name)) continue;
         // `${7001}` is an already-bound parameter id, not a name to get-or-create.
         if (/^\d+$/.test(name)) continue;
         const isSlot = allRuntimeNames.has(name);
         const defaultValue = isSlot ? runtimeSlotValue(paramDefault(name, tc.data, s.value)) : paramDefault(name, tc.data, s.value);
-        const id = await this.getOrCreateParameter(projectId, moduleId, name, defaultValue, isSlot ? 'Runtime' : 'Local');
-        paramIdByName.set(name, id);
+        queueParam(name, defaultValue, isSlot ? 'Runtime' : 'Local');
       }
       if (s.recordedParam) {
         const runtimeNames = new Set(slotNamesByStep.get(s) ?? []);
         for (const [name, value] of Object.entries(s.recordedParam)) {
-          if (paramIdByName.has(name)) continue;
+          if (paramIdByName.has(name) || queuedParams.has(name)) continue;
           // An all-digit key is an EXISTING parameter id, not a name — map it to itself and never
           // create a parameter named "7001" (that junk row is exactly what a copied step bound to).
           if (/^\d+$/.test(name)) {
@@ -4588,21 +6160,17 @@ export class SimplifyQaAdapter {
           // A store slot ("Runtime Parameter") must be a Runtime param so the agent hands the plugin a
           // writable argument; everything else stays Local.
           const isSlot = runtimeNames.has(name);
-          const id = await this.getOrCreateParameter(projectId, moduleId, name,
-            isSlot ? runtimeSlotValue(String(value ?? '')) : String(value ?? ''), isSlot ? 'Runtime' : 'Local');
-          paramIdByName.set(name, id);
+          queueParam(name, isSlot ? runtimeSlotValue(String(value ?? '')) : String(value ?? ''), isSlot ? 'Runtime' : 'Local');
         }
         // DATABASE steps: parameters referenced inside an argument value (`${suffix}` / `{{suffix}}` in a filter) must
         // exist so the mapper can bind them (parameterizedParamIds).
         if (s.stepType === 'database') {
           for (const [argName, value] of Object.entries(s.recordedParam)) {
             for (const name of extractValueParamNames(value)) {
-              if (name === argName || paramIdByName.has(name)) continue;
+              if (name === argName) continue;
               // `{{7001}}` is already a bound id — never a parameter name.
               if (/^\d+$/.test(name)) continue;
-              const id = await this.getOrCreateParameter(projectId, moduleId, name, paramDefault(name, tc.data, undefined),
-                allRuntimeNames.has(name) ? 'Runtime' : 'Local');
-              paramIdByName.set(name, id);
+              queueParam(name, paramDefault(name, tc.data, undefined), allRuntimeNames.has(name) ? 'Runtime' : 'Local');
             }
           }
         }
@@ -4616,12 +6184,16 @@ export class SimplifyQaAdapter {
           // A purely-numeric token is an ALREADY-BOUND `{{<paramId>}}` (round-tripped from the
           // backend), not a parameter name — never create a parameter for it.
           if (/^\d+$/.test(name)) continue;
-          if (paramIdByName.has(name)) continue;
-          const id = await this.getOrCreateParameter(projectId, moduleId, name, paramDefault(name, tc.data, undefined));
-          paramIdByName.set(name, id);
+          queueParam(name, paramDefault(name, tc.data, undefined), 'Local');
         }
       }
     }
+    // Resolve every collected token with bounded concurrency. getOrCreateParameter is idempotent per
+    // name (it recovers a race-lost duplicate by re-reading), so distinct names are safe in parallel.
+    await mapLimit(pendingParams, 6, async (p) => {
+      const id = await this.getOrCreateParameter(projectId, moduleId, p.name, p.value, p.access);
+      paramIdByName.set(p.name, id);
+    });
     if (accessById) {
       // The catalog's access type is what the executor keys on for RUNTIME substitution. Copy only the
       // ids this save will bind (plus every round-tripped sourceParameterId so an untouched step is
@@ -4666,6 +6238,49 @@ export class SimplifyQaAdapter {
   /** Populated by actionCatalog() on each fetch. Surfaced in resolveAutomationSteps error messages
    *  so a user hitting "no SQA action named X" can see what the fetch actually returned. */
   private actionCatalogFetchDiag: string = 'never fetched';
+
+  /** Targeted `POST /tm/action/search` for ONE action by id, name or display name. The cached catalog can
+   *  miss a project's newer custom actions (type CUSTOM), and `GET /tm/action/:id` is not an option for
+   *  them (the backend reads the id as a project id → "Project not found"). Returns undefined on no hit. */
+  private async findActionLive(key: string): Promise<ActionCatalogEntry | undefined> {
+    const projectId = this.requireProjectId();
+    const numeric = /^\d+$/.test(key.trim());
+    const columns = numeric ? ['id'] : ['name', 'disname'];
+    for (const column of columns) {
+      let raw: any;
+      try {
+        raw = await this.http.postJson<any>('/tm/action/search', {
+          searchFields: [
+            { column: 'deleted', value: false },
+            { column: 'projectId', value: { $in: [0, projectId] } },
+            { column, value: numeric ? Number.parseInt(key, 10) : key.trim() },
+          ],
+          startIndex: 0,
+          limit: 10,
+          selectFields: ['id', 'name', 'objectTemplate', 'objectRequired', 'uniqueId', 'disname', 'projectId'],
+        });
+      } catch { continue; }
+      const rows = pickArray(raw, 'data', 'content', 'actions');
+      const want = key.trim().toLowerCase();
+      const row = rows.find((r: any) => numeric ? str(r, 'id', '_id', 'actionId') === String(Number.parseInt(key, 10))
+        : [str(r, 'name'), str(r, 'disname', 'displayName')].some(v => v?.toLowerCase() === want));
+      const idStr = row ? str(row, 'id', '_id', 'actionId') : undefined;
+      if (!row || !idStr) continue;
+      const otRaw = row?.objectTemplate;
+      const objectTemplate = typeof otRaw === 'number' ? otRaw
+        : typeof otRaw === 'string' && /^\d+$/.test(otRaw) ? Number.parseInt(otRaw, 10) : undefined;
+      const name = str(row, 'name');
+      const displayName = str(row, 'disname', 'displayName') ?? undefined;
+      return {
+        id: Number.parseInt(idStr, 10),
+        objectRequired: row?.objectRequired === true,
+        ...(objectTemplate !== undefined ? { objectTemplate } : {}),
+        ...(displayName ? { displayName } : {}),
+        ...(name ? { name } : {}),
+      };
+    }
+    return undefined;
+  }
 
   private actionCatalog(): Promise<Map<string, ActionCatalogEntry>> {
     if (this.actionCatalogCache) return this.actionCatalogCache;
@@ -4916,12 +6531,26 @@ export class SimplifyQaAdapter {
   ): Promise<Array<{ actionId: number | null; objectId: number | null | undefined }>> {
     const catalog = await this.actionCatalog();
     const steps = Array.isArray(tc.steps) ? tc.steps : [];
+    // "while" / "end_while" / "do_while" … become the markers SimplifyQA reads (WHILE_START / WHILE_END / DO / the closing WHILE)
+    normalizeLoopKinds(steps);
     // ponytail: objectId can be `undefined` here to mean "don't emit — preserve the backend value".
     // Used when an existing step (sourceId set) has no round-trip objectRef.id, e.g. because it was
     // recorded before objectRequired was flipped on the action. Emitting null would $set-clobber the DB.
     // actionId also nullable for control-flow / function / switch / function_end — those steps don't
     // have an action; buildAutomationPayload omits action/object emit when actionId is null.
     const out: Array<{ actionId: number | null; objectId: number | null | undefined }> = [];
+    // One lookup per object NAME per save: a recording often touches the same element several times
+    // ("Type ..." then "Wait until ..."), and each repeat used to be another round-trip.
+    const objectIdByName = new Map<string, Promise<number | null>>();
+    const lookupObjectByName = (projId: number, name: string): Promise<number | null> => {
+      const key = name.trim().toLowerCase();
+      let hit = objectIdByName.get(key);
+      if (!hit) {
+        hit = this.findObjectIdByName(projId, name);
+        objectIdByName.set(key, hit);
+      }
+      return hit;
+    };
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i]!;
       // ponytail: control-flow / function / switch / function_end steps have no action to resolve.
@@ -4950,6 +6579,40 @@ export class SimplifyQaAdapter {
               },
             }),
           };
+        }
+        // WHILE / DO-WHILE / IF with a real condition: write the condition rows + readable text (not just a label)
+        if (s.stepType === 'control_flow' && !s.desktopConditions?.length) {
+          const specs = stepConditions(s);
+          const wire = String(s.sourceRaw?.['stepType'] ?? s.controlFlow?.kind ?? '').toUpperCase();
+          if (specs.length && !CONDITION_KINDS.has(wire)) {
+            throw new Error(`Step ${i + 1}: ${wire} takes no condition. The condition of a WHILE is on WHILE_START ("while"), of a DO-WHILE on its closing WHILE ("end_do_while").`);
+          }
+          if (specs.length) {
+            const tech = (deriveTcType(tc) || 'WEB').toUpperCase();
+            s.sourceRaw = {
+              ...(s.sourceRaw ?? {}),
+              conditions: await buildConditionRows(wire, specs, {
+                projectId, technology: tech,
+                action: (names, uid) => {
+                  const hit = (uid ? (catalog.get(`uniq::${uid}`) ?? catalog.get(`dis::${uid.toLowerCase()}`)) : undefined)
+                    ?? names.map((n) => catalog.get(`${tech}::${n}`) ?? catalog.get(n)).find(Boolean);
+                  return hit ? { id: hit.id, displayName: hit.displayName, name: hit.name, objectRequired: hit.objectRequired } : undefined;
+                },
+                object: async (ref) => {
+                  if (ref.objectId) {
+                    const id = Number.parseInt(numericId(ref.objectId), 10);
+                    if (!Number.isFinite(id)) throw new Error(`Step ${i + 1}: object "${ref.objectId}" is not an object id.`);
+                    const o = await this.getObject(String(id)).catch(() => undefined);
+                    if (!o?.name) throw new Error(`Step ${i + 1}: object ${ref.objectId} was not found in this project.`);
+                    return { id, name: o.name };
+                  }
+                  const id = await lookupObjectByName(projectId, ref.objectName ?? '');
+                  if (id == null) throw new Error(`Step ${i + 1}: no object named "${ref.objectName}" in this project — give its objectId.`);
+                  return { id, name: ref.objectName ?? '' };
+                },
+              }),
+            };
+          }
         }
         out.push({ actionId: null, objectId: null });
         continue;
@@ -5010,37 +6673,23 @@ export class SimplifyQaAdapter {
       // Fallback: if the by-id scan misses (action created in a different project and thus not in
       // the UI's projectId-filtered catalog), fetch it directly via GET /tm/action/:id. Only tries
       // for numeric-id lookups — model-authored name lookups have no id to fetch.
+      // The catalog can miss a project's newer custom actions, so look the id / name / display name up
+      // directly with a targeted search (never GET /tm/action/:id — that route reads the id as a project id).
       let fallbackDiag = '';
-      if (!meta && isNumericId) {
+      if (!meta) {
         try {
-          const raw = await this.http.getJson<any>(`/tm/action/${Number.parseInt(name, 10)}`);
-          const row = raw?.data && typeof raw.data === 'object' ? raw.data
-            : Array.isArray(raw?.data) ? raw.data[0]
-            : Array.isArray(raw) ? raw[0]
-            : raw;
-          const idStr = str(row, 'id', '_id', 'actionId');
-          // ponytail: no `technology` gate. Catalog builder proved action rows have no top-level
-          // technology field (see comment at ~line 2357); requiring it here made the fallback
-          // never succeed — every cross-project action id threw "no SQA action named X".
-          if (idStr) {
-            const otRaw = row?.objectTemplate;
-            const objectTemplate = typeof otRaw === 'number' ? otRaw
-              : typeof otRaw === 'string' && /^\d+$/.test(otRaw) ? Number.parseInt(otRaw, 10)
-              : undefined;
-            meta = {
-              id: Number.parseInt(idStr, 10),
-              objectRequired: row?.objectRequired === true,
-              ...(objectTemplate !== undefined ? { objectTemplate } : {}),
-            };
-          } else {
-            fallbackDiag = ` [GET /tm/action/${name} returned no usable row (idStr=null). Raw keys: ${row && typeof row === 'object' ? Object.keys(row).join(',') : typeof row}]`;
-          }
+          meta = await this.findActionLive(name);
         } catch (e) {
-          fallbackDiag = ` [GET /tm/action/${name} failed: ${(e as Error).message}]`;
+          fallbackDiag = ` [action search failed: ${(e as Error).message}]`;
+        }
+        if (meta) {
+          catalog.set(`id::${meta.id}`, meta);
+          if (meta.name) catalog.set(meta.name.toLowerCase(), meta);
+          if (meta.displayName) catalog.set(`dis::${meta.displayName.toLowerCase()}`, meta);
         }
       }
       if (!meta) {
-        throw new Error(`Automation step ${i + 1}: no SQA action named "${name}" for technology ${tech}. Catalog size=${catalog.size}, numericId=${isNumericId}. FetchDiag: ${this.actionCatalogFetchDiag}.${fallbackDiag}`);
+        throw new Error(`Automation step ${i + 1}: the action "${name}" was not found in the action list for technology ${tech} (project ${projectId}). Check the action id, method name or display name.${fallbackDiag} [catalog: ${this.actionCatalogFetchDiag}]`);
       }
       let objectId: number | null | undefined = null;
       if (meta.objectRequired) {
@@ -5060,7 +6709,7 @@ export class SimplifyQaAdapter {
         const idIsSaved = !Number.isFinite(roundTripId) || String(roundTripId) === s.sourceObjectId;
         const nameDiffers = !!refName && !!s.sourceObjectName && refName.toLowerCase() !== s.sourceObjectName.trim().toLowerCase();
         if (refName && !(s.objectRef?.locators?.length) && s.sourceId && idIsSaved && (!Number.isFinite(roundTripId) || nameDiffers)) {
-          const found = await this.findObjectIdByName(projectId, refName);
+          const found = await lookupObjectByName(projectId, refName);
           if (found == null) {
             throw new Error(`Automation step ${i + 1} ("${name}"): no object named "${refName}" found in this project. Pass objectRef.id, or objectRef.locators to create one.`);
           }
@@ -5070,7 +6719,7 @@ export class SimplifyQaAdapter {
         } else if (s.sourceId) {
           objectId = undefined;
         } else if (s.objectRef?.name && !(s.objectRef.locators?.length)) {
-          const found = await this.findObjectIdByName(projectId, s.objectRef.name);
+          const found = await lookupObjectByName(projectId, s.objectRef.name);
           if (found != null) {
             objectId = found;
           } else {
@@ -5125,13 +6774,18 @@ export class SimplifyQaAdapter {
   private async reconcileObjectParams(
     steps: Step[], resolutions: Array<{ actionId: number | null; objectId: number | null | undefined }>,
   ): Promise<void> {
+    // Changed objects are independent per step — fetch their old/new parameter data in parallel.
+    const changed: Array<{ s: Step; oldId: number; newId: number }> = [];
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i]!;
       const newId = resolutions[i]?.objectId;
       const oldId = s.sourceObjectId ? Number.parseInt(s.sourceObjectId, 10) : NaN;
       if (typeof newId !== 'number' || !Number.isFinite(oldId) || oldId === newId) continue;
-      const [oldObj, newObj] = [await this.fetchObjectParams(oldId), await this.fetchObjectParams(newId)];
-      if (!newObj) continue;
+      changed.push({ s, oldId, newId });
+    }
+    await mapLimit(changed, 6, async ({ s, oldId, newId }) => {
+      const [oldObj, newObj] = await Promise.all([this.fetchObjectParams(oldId), this.fetchObjectParams(newId)]);
+      if (!newObj) return;
       const keep = new Set(newObj.parameterId);
       const rec = { ...(s.sourceRecordedParam ?? {}) };
       const drop = new Set((oldObj?.parameterId ?? []).filter((id) => !keep.has(id) && String(rec[String(id)] ?? '').trim() === ''));
@@ -5142,7 +6796,7 @@ export class SimplifyQaAdapter {
       s.sourceObjectParameterIds = newObj.attrIds;
       if (Object.keys(rec).length) s.sourceRecordedParam = rec; else delete s.sourceRecordedParam;
       s.sourceObjectId = String(newId);   // idempotent: a draft saved twice does not re-derive
-    }
+    });
   }
 
   /** Case-insensitive project-scoped exact-name lookup. Backend duplicate-name check uses Mongo
@@ -5639,10 +7293,100 @@ export class SimplifyQaAdapter {
    *  (`type:'EXECUTIONPLAN'`, `childExecution`, `parentExecutionId`) whose items are the assigned,
    *  non-blocked AUTOMATION entries matched to the shell's items. Every refusal happens before the
    *  first write. `POST /tm/execplantestcases/execute` (dead code) is never used. */
-  async startExecutionPlanRun(planId: string, opts: { agentId?: string }): Promise<PlanRunRef> {
+  /** The plan's saved STACK canvas (`/tm/executionFlow/EP/<id>/STACK`) or null. */
+  async getPlanStacks(planId: string): Promise<Record<string, any> | null> {
+    const plan = await this.readOwnPlan(planId);
+    const raw = await this.http
+      .getJson<any>(`/tm/executionFlow/EP/${plan['id']}/STACK`)
+      .catch(() => undefined);
+    const doc = raw?.data ?? raw;
+    return doc && typeof doc === 'object' && doc.id !== undefined ? doc : null;
+  }
+
+  /** Configure the plan's STACK canvas with N stacks and distribute its automation test cases across
+   *  them — the same document the UI's Stack Setup saves (`POST/PUT /tm/executionFlow`, flowType
+   *  'STACK'). Round-robin by default; the backend divides the saved stacks at run time. */
+  async configurePlanStacks(planId: string, opts: { count: number; mode?: 'CLOUD' | 'LOCAL'; browser?: string }): Promise<{
+    created: boolean;
+    /** CLOUD stacks only: whether the project has a cloud machine to run them on. */
+    cloudAvailable?: boolean;
+    stacks: Array<{ id: string; name: string; mode: string; codes: string[] }>;
+  }> {
+    const count = Math.trunc(opts.count);
+    if (!Number.isFinite(count) || count < 1) throw new Error('stacks must be at least 1.');
+    const plan = await this.readOwnPlan(planId, { writable: true });
+    const projectId = this.requireProjectId();
+    const mode = (opts.mode ?? 'CLOUD').toUpperCase() as 'CLOUD' | 'LOCAL';
+
+    const entries = (await this.listPlanEntries(Number(plan['id'])))
+      .filter((e) => String(e.executionType ?? '').toUpperCase() === 'AUTOMATION' && String(e.status ?? '').toUpperCase() !== 'BLOCKED');
+    if (!entries.length) throw new Error(`${plan['code'] ?? planId} has no AUTOMATION test cases to distribute.`);
+
+    const browserKey = (opts.browser ?? 'chrome').toLowerCase();
+    const browser = { name: browserKey.charAt(0).toUpperCase() + browserKey.slice(1), key: browserKey, type: 'NONE' };
+    const existing = await this.getPlanStacks(planId);
+    const stackDefs: any[] = Array.from({ length: count }, (_, i) => ({
+      id: randomUUID(), name: `Stack ${i + 1}`, position: null,
+      mode, agentId: null,
+      executionPlatform: { LOCAL: {}, REMOTE: {}, CLOUD: mode === 'CLOUD' ? { browser } : {} },
+      items: [] as any[],
+    }));
+    entries.forEach((e, i) => {
+      const stack = stackDefs[i % count];
+      const tech = String(e.tcType ?? 'WEB').toUpperCase();
+      const p = e.executionPlatform ?? {};
+      const platform = PLAN_SPECIAL_TECH.includes(tech)
+        ? [{ name: tech, id: tech, technologyType: tech, type: 'NONE' }]
+        : tech === 'WEB'
+          ? [{ name: browser.name, id: browser.key, technologyType: 'WEB', type: 'NONE' }]
+          : [{ name: p.name, id: p.id, technologyType: p.technologyType ?? tech, type: p.type ?? 'NONE',
+              ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) }];
+      const item = {
+        id: e.testcaseId, versionId: e.tcVersionId, stepId: e.stepId, type: e.type ?? 'TC',
+        technologyType: tech, name: e.tcName ?? '', description: '', versionName: e.versionName ?? '',
+        seq: e.seq ?? 0, stepCount: -1, code: e.code ?? '', prerequisite: '',
+        projectId, projectName: '', moduleId: e.moduleId ?? null, moduleName: '',
+        userstoryId: e.userstoryId ?? null, userstoryName: '',
+        sourceType: e.sourceType ?? null, sourceId: e.sourceId ?? null,
+        assignTo: e.expAssignedTo ?? null, assignDate: e.expAssignedDate ?? null, assigneeName: '',
+        createdByName: '', createdBy: null,
+        executionType: 'AUTOMATION', status: 'NOTEXECUTED', executionId: null, executionOS: null,
+        iterationsSelected: [], platform,
+      };
+      stack.items.push(item);
+    });
+
+    const payload: Record<string, unknown> = {
+      ...(existing?.['id'] ? { id: existing['id'] } : {}),
+      parentId: Number(plan['id']), parentType: 'EP', flowType: 'STACK', projectId,
+      viewMode: false, stacks: stackDefs.map((s) => ({ ...s, position: s.position ?? null })),
+      connections: [], canvasConfig: { startNodePosition: { x: 0, y: 0 } },
+    };
+    if (existing?.['id']) await this.http.putJson<any>('/tm/executionFlow', payload);
+    else await this.http.postJson<any>('/tm/executionFlow', payload);
+
+    // Read it back — the canvas shows the saved document, and a run divides by it.
+    const after = await this.getPlanStacks(planId);
+    const savedStacks: any[] = Array.isArray(after?.['stacks']) ? after['stacks'] : [];
+    if (savedStacks.length !== count) {
+      throw new Error(`Saved ${count} stack(s) but the plan's STACK drawing reads back ${savedStacks.length}.`);
+    }
+    const cloudAvailable = mode === 'CLOUD' ? (await this.listCloudRunners().catch(() => [])).some((r) => r.online) : undefined;
+    return {
+      created: !existing,
+      ...(cloudAvailable !== undefined ? { cloudAvailable } : {}),
+      stacks: savedStacks.map((s: any, i: number) => ({
+        id: String(s.id ?? ''), name: String(s.name ?? `Stack ${i + 1}`), mode: String(s.mode ?? mode),
+        codes: (Array.isArray(s.items) ? s.items : []).map((it: any) => String(it.code ?? `TC-${it.id}`)),
+      })),
+    };
+  }
+
+  async startExecutionPlanRun(planId: string, opts: { agentId?: string; mode?: 'local' | 'remote' | 'cloud' | 'stack' }): Promise<PlanRunRef> {
     const plan = await this.readOwnPlan(planId);
     const code = String(plan['code'] ?? `PL-${plan['id']}`);
     const projectId = this.requireProjectId();
+    const runMode = opts.mode ?? 'local';
 
     const reasons: Array<{ code: string; reason: string }> = [];
     const runnable: any[] = [];
@@ -5659,12 +7403,60 @@ export class SimplifyQaAdapter {
     const noPlatform = runnable.filter((e) => !PLAN_SPECIAL_TECH.includes(String(e.tcType)) && !e.executionPlatform?.id);
     if (noPlatform.length) throw new Error(`Set an execution platform first for: ${noPlatform.map((e) => str(e, 'code')).join(', ')}.`);
 
-    const probe = await this.probeLocalAgentDetailed();
-    if (!probe.up) {
-      throw new Error(`Can't run ${code} locally: the SimplifyQA desktop agent at ${probe.url ?? '(no URL)'} is not reachable` +
-        `${probe.reason ? ` (${probe.reason})` : ''}. Start it, then try again.`);
+    // LOCAL uses this machine's agent; REMOTE the other machine's agent the caller names; CLOUD the project's configured
+    // cloud machine; STACK is the canvas-saved stack drawing (auto-distributed), divided server-side. Like the UI's
+    // Execute dialog, a STACK run sends the live local agent (for its LOCAL stacks) and the project's cloud type
+    // (NONE when cloud isn't set up) — it is NOT gated on a cloud machine unless a stack really is CLOUD.
+    let agentId: string | undefined;
+    let cloudType = 'NONE';
+    const requireLocalAgent = async (): Promise<string> => {
+      const probe = await this.probeLocalAgentDetailed();
+      if (!probe.up) {
+        throw new Error(`Can't run ${code} locally: the SimplifyQA desktop agent at ${probe.url ?? '(no URL)'} is not reachable` +
+          `${probe.reason ? ` (${probe.reason})` : ''}. Start it, then try again.`);
+      }
+      return this.resolveLocalAgentId(opts.agentId);
+    };
+    const onlineCloud = async () => (await this.listCloudRunners().catch(() => [])).filter((r) => r.online);
+    if (runMode === 'local') {
+      agentId = await requireLocalAgent();
+    } else if (runMode === 'remote') {
+      if (!opts.agentId) throw new Error(`Running ${code} on a remote machine needs agentId — the other machine's agent (see remote_agents).`);
+      agentId = opts.agentId;
+    } else if (runMode === 'cloud') {
+      const online = await onlineCloud();
+      if (!online.length) {
+        throw new Error(
+          `No cloud machine is configured for this project, so ${code} cannot run on the cloud. ` +
+            'Add/assign a cloud machine (VM / Azure / Kubernetes) in the project settings, or run the plan locally.',
+        );
+      }
+      cloudType = online[0]?.cloudType ?? 'VM';
+    } else {
+      const flow = await this.getPlanStacks(planId);
+      const stacks: any[] = Array.isArray(flow?.['stacks']) ? flow!['stacks'] : [];
+      if (!stacks.length) throw new Error(`${code} has no saved stack setup — configure it first (action:"stack_setup").`);
+      // The backend runs only the stacks holding a test case assigned to the user who starts the run, and silently does
+      // nothing for anyone else — refuse that here instead of reporting a run that executes nothing.
+      const me = await this.ensureUserId();
+      const mine = stacks.filter((s) => (Array.isArray(s?.items) ? s.items : []).some((i: any) => me != null && String(i?.assignTo) === String(me)));
+      if (!mine.length) {
+        throw new Error(`None of ${code}'s stack test cases are assigned to you, so a stack run started by you would execute nothing. ` +
+          'Run it as the assignee, or assign the test cases to yourself.');
+      }
+      const cloudStacks = mine.filter((s) => String(s?.mode).toUpperCase() === 'CLOUD');
+      if (cloudStacks.length) {
+        const online = await onlineCloud();
+        if (!online.length) {
+          throw new Error(
+            `${code} has CLOUD stack(s) (${cloudStacks.map((s) => s?.name ?? s?.id).join(', ')}) but this project has no cloud machine configured. ` +
+              'Add/assign a cloud machine (VM / Azure / Kubernetes) in the project settings, or re-run stack_setup with stackMode:"local".',
+          );
+        }
+        cloudType = online[0]?.cloudType ?? 'VM';
+      }
+      if (mine.some((s) => String(s?.mode).toUpperCase() === 'LOCAL')) agentId = await requireLocalAgent();
     }
-    const agentId = await this.resolveLocalAgentId(opts.agentId);
 
     const shellRaw = await this.http.postJson<any>('/exec/execution/search', {
       searchFields: [
@@ -5702,14 +7494,16 @@ export class SimplifyQaAdapter {
     for (const k of PLAN_RUN_DROP_KEYS) delete body[k];
     Object.assign(body, {
       type: 'EXECUTIONPLAN', isRecordingEnabled: false, executionOS: this.detectExecutionOS(), status: 'INPROGRESS',
-      executionType: 'AUTOMATION', mode: 'LOCAL', executionStyle: 'SERIAL', agentId, cloudType: 'NONE',
+      executionType: 'AUTOMATION',
+      mode: runMode === 'local' ? 'LOCAL' : runMode === 'remote' ? 'REMOTE' : runMode === 'cloud' ? 'CLOUD' : 'STACK',
+      executionStyle: 'SERIAL', agentId: agentId ?? null, cloudType,
       releaseId: plan['releaseId'] ?? null, iterationId: plan['iterationId'] ?? null,
       childExecution: true, parentExecutionId: Number(shell.id),
       globalConfiguration: {
         TERMINATE_ON_FAIL: plan['terminateOnFailure'] ?? false, NEW_BROWSER_SESSION: plan['newBrowserSession'] ?? false,
         RE_EXECUTION_COUNT: plan['autoReExecCount'] ?? 0, RE_EXECUTION_TYPE: plan['autoReExecTriggerOn'] ?? 'AFTER_TESTCASE',
       },
-      executionItems: items,
+      executionItems: runMode === 'stack' ? [] : items,
     });
     let created: any;
     try {
@@ -5802,6 +7596,39 @@ export class SimplifyQaAdapter {
 
   // ---------------------------------------------------------------------- Scheduler
 
+  /** The names schedules already have in the active project (lower-case → id / code) — the Scheduler refuses a second one. */
+  private async scheduleNames(): Promise<Map<string, { id: string; code?: string }>> {
+    const out = new Map<string, { id: string; code?: string }>();
+    // best effort: a failed lookup must not block scheduling — the Scheduler's own duplicate answer is still translated (scheduleNameError)
+    const raw = await this.http.postJson<any>('/sh/scheduler/search', this.searchBody(
+      [{ column: 'projectId', value: this.requireProjectId() }], { limit: 500, rawOffset: true })).catch(() => undefined);
+    for (const r of raw ? pickArray(raw, 'data', 'content') : []) {
+      if (r?.deleted === true || typeof r?.name !== 'string') continue;
+      out.set(r.name.trim().toLowerCase(), { id: String(r.id), ...(r.code ? { code: String(r.code) } : {}) });
+    }
+    return out;
+  }
+
+  /** The Scheduler form's rule for a name: 3–501 characters, unique in the project. `selfId` is the schedule being renamed. */
+  private checkScheduleName(name: string, taken: Map<string, { id: string; code?: string }>, selfId?: string): string {
+    const n = String(name ?? '').trim();
+    if (n.length < 3) throw new Error('A schedule name needs at least 3 characters.');
+    if (n.length > 501) throw new Error('A schedule name can be at most 501 characters.');
+    const clash = taken.get(n.toLowerCase());
+    if (clash && clash.id !== selfId) {
+      throw new Error(`A schedule named "${n}" already exists in this project (${clash.code ?? `#${clash.id}`}). Pick another name — the Scheduler needs each schedule name to be unique.`);
+    }
+    return n;
+  }
+
+  /** The Scheduler's own duplicate answer (HTTP 409 / DUPLICATENAME), said in words. */
+  private scheduleNameError(e: unknown, name: string): Error | undefined {
+    const text = e instanceof ApiError ? `${e.body} ${e.message}` : (e instanceof Error ? e.message : String(e));
+    return /DUPLICATENAME|Duplicate Name|\b409\b/i.test(text)
+      ? new Error(`A schedule named "${name}" already exists in this project — the Scheduler needs each schedule name to be unique. Pick another name.`)
+      : undefined;
+  }
+
   /** A schedule — the scheduler form's body (scheduler-form.component.ts:363-388, +tz on create). TC:
    *  the browser as its platform; SU: one platform per technology in the suite (suitePlatform). An execution
    *  plan is refused: the Scheduler UI offers only test case and suite (its EP option is commented out). */
@@ -5828,10 +7655,19 @@ export class SimplifyQaAdapter {
       throw new Error('Nothing to schedule: give a test case or a suite.');
     }
     const timeZone = opts.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const rec = sqaRecurrence(opts.scheduleType, opts.scheduledFor, opts.endDate, timeZone);
+    const rec = sqaRecurrence(opts.scheduleType, opts.scheduledFor, opts.endDate, timeZone, recurrenceExtras(opts));
     const code = String(parent['code'] ?? parent['id']);
+    // the caller's name; or "<TC-22> schedule", numbered when taken — a second schedule of the same target used to fail with HTTP 409
+    const taken = await this.scheduleNames();
+    let scheduleName: string;
+    if (opts.name !== undefined) scheduleName = this.checkScheduleName(opts.name, taken);
+    else {
+      const base = `${code} schedule`;
+      scheduleName = base;
+      for (let i = 2; taken.has(scheduleName.toLowerCase()); i++) scheduleName = `${base} ${i}`;
+    }
     const body: Record<string, unknown> = {
-      projectId, name: `${code} schedule`, schedulerType, parentId: Number(parent['id']),
+      projectId, name: scheduleName, schedulerType, parentId: Number(parent['id']),
       ...(parentVersionId ? { parentVersionId } : {}),
       platForm,
       environment: opts.environmentId ? await this.environmentKey(opts.environmentId) : 'general',
@@ -5845,10 +7681,16 @@ export class SimplifyQaAdapter {
       offset: new Date().getTimezoneOffset(), tz: timeZone,
       retryConfig: { retryEnabled: false, retryCount: 1, retryIntervalMinutes: 5 },
     };
-    const raw = await this.http.postJson<any>('/sh/scheduler', body);
+    let raw: any;
+    try {
+      raw = await this.http.postJson<any>('/sh/scheduler', body);
+    } catch (e) {
+      throw this.scheduleNameError(e, scheduleName) ?? e;
+    }
     const doc = raw?.data ?? raw;
     return {
       id: String(doc?.id ?? ''),
+      name: String(doc?.name ?? scheduleName),
       ...(doc?.status ? { status: String(doc.status) } : {}),
       ...(doc?.nextRecurrenceTime ? { nextRunAt: String(doc.nextRecurrenceTime) } : {}),
     };
@@ -5859,6 +7701,7 @@ export class SimplifyQaAdapter {
       [{ column: 'projectId', value: this.requireProjectId() }], { limit: 500, rawOffset: true }));
     return pickArray(raw, 'data', 'content').map((r: any) => ({
       id: String(r.id),
+      ...(typeof r.name === 'string' && r.name ? { name: r.name } : {}),
       target: `${r.schedulerType ?? ''} ${r.parentId ?? ''} — ${r.name ?? r.code ?? ''}`.trim(),
       scheduleType: String(r.recurrenceType ?? ''),
       status: String(r.status ?? ''),
@@ -5894,6 +7737,7 @@ export class SimplifyQaAdapter {
     }
     body['reccurenceData'] = rec;
     Object.assign(body, changes, { nextRecurrenceTime: null, updateVersion: doc['updateVersion'] ?? 0 });
+    for (const k of Object.keys(changes)) if (changes[k] === undefined) delete body[k];
     const raw = await this.http.putJson<any>(`/sh/scheduler/${doc['id']}`, body).catch((e) => this.rethrowWrite(e, doc));
     const out = raw?.data ?? raw;
     return { id: String(doc['id']), ...(out?.status ? { status: String(out.status) } : {}) };
@@ -5902,15 +7746,18 @@ export class SimplifyQaAdapter {
   async updateSchedule(scheduleId: string, changes: ScheduleUpdate): Promise<ScheduleRef> {
     const doc = await this.readOwnSchedule(scheduleId);
     const patch: Record<string, unknown> = {};
-    if (changes.scheduledFor || changes.scheduleType || changes.endDate !== undefined) {
+    const extras = recurrenceExtras(changes);
+    // a change to N / days / day-of-month rebuilds the cadence the schedule already has
+    const cadence = changes.scheduleType ?? (Object.keys(extras).length ? neutralCadence(doc) : undefined);
+    if (changes.scheduledFor || changes.scheduleType || changes.endDate !== undefined || cadence) {
       const start = changes.scheduledFor ?? String(doc['scheduleStartDate']);
       const storedOnce = String(doc['recurrenceType'] ?? 'ONCE').toUpperCase() === 'ONCE';
-      if (changes.scheduleType) {
+      if (cadence) {
         // A new cadence: rebuilt like a new schedule. Its end date is the one given, or the stored
         // one only when the schedule already recurred (a ONCE schedule's end is just its start).
         const end = realEndDate(changes.endDate) ?? (storedOnce ? undefined : realEndDate(doc['scheduleEndDate']));
-        if (changes.scheduleType !== 'once' && !end) throw new Error(NEEDS_END_DATE);
-        const rec = sqaRecurrence(changes.scheduleType, start, end, changes.timezone ?? doc['tz'] ?? Intl.DateTimeFormat().resolvedOptions().timeZone);
+        if (cadence !== 'once' && !end) throw new Error(NEEDS_END_DATE);
+        const rec = sqaRecurrence(cadence, start, end, changes.timezone ?? doc['tz'] ?? Intl.DateTimeFormat().resolvedOptions().timeZone, extras);
         Object.assign(patch, {
           scheduleStartDate: start, scheduleEndDate: rec.scheduleEndDate,
           recurrenceType: rec.recurrenceType, reccurenceData: rec.reccurenceData,
@@ -5931,14 +7778,76 @@ export class SimplifyQaAdapter {
       // A new start time restarts a cancelled schedule, as the UI's restart does.
       if (changes.scheduledFor && doc['cancelled'] === true) Object.assign(patch, { cancelled: false, status: 'NOT STARTED' });
     }
-    if (changes.browser && doc['schedulerType'] === 'TC') {
+    // WHAT it runs: a test case or a suite — the same schedule, re-pointed (the Scheduler form's type + target), with the platform and
+    // version that kind of schedule carries, as createSchedule builds them.
+    const notes: string[] = [];
+    let target: { type: 'TC' | 'SU'; id: number; code: string } | undefined;
+    if (changes.tcId !== undefined || changes.suiteId !== undefined) {
+      if (changes.tcId !== undefined && changes.suiteId !== undefined) throw new Error('Give either a test case (tcId) or a suite (suiteId) to run, not both.');
+      const projectId = this.requireProjectId();
+      const wasType = String(doc['schedulerType'] ?? '');
+      if (changes.suiteId !== undefined) {
+        const suite = await this.readOwnSuite(changes.suiteId);
+        const platForm = suitePlatform(suite, changes.browser, 'schedule it');
+        Object.assign(patch, { schedulerType: 'SU', parentId: Number(suite['id']), platForm, parentVersionId: undefined });
+        target = { type: 'SU', id: Number(suite['id']), code: String(suite['code'] ?? `SU-${suite['id']}`) };
+      } else {
+        const tc = await this.fetchRawTestcase(changes.tcId!);
+        if (!Object.keys(tc).length || tc['deleted'] === true) throw new Error(`Test case ${changes.tcId} not found.`);
+        if (Number(tc['projectId']) !== projectId) throw new Error(`${tc['code'] ?? `TC-${tc['id']}`} is not in project ${projectId}.`);
+        // keep the browser the schedule already runs WEB in (a suite schedule has one per technology) unless a new one is given
+        const webEntry = (Array.isArray(doc['platForm']) ? doc['platForm'] : []).find((p: any) => String(p?.technologyType ?? '').toUpperCase() === 'WEB');
+        const keepBrowser = changes.browser ?? (webEntry?.id ? String(webEntry.id) : undefined);
+        Object.assign(patch, {
+          schedulerType: 'TC', parentId: Number(tc['id']), platForm: tcPlatform(tc, keepBrowser),
+          parentVersionId: testcaseVersion(tc, true).versionId || undefined,
+        });
+        target = { type: 'TC', id: Number(tc['id']), code: String(tc['code'] ?? `TC-${tc['id']}`) };
+      }
+      if (wasType === target.type && Number(doc['parentId']) === target.id) { target = undefined; for (const k of ['schedulerType', 'parentId', 'platForm', 'parentVersionId']) delete patch[k]; }
+      else if (wasType !== target.type) notes.push(`This schedule was a ${wasType === 'SU' ? 'Suite' : 'Test Case'} schedule; it is now a ${target.type === 'SU' ? 'Suite' : 'Test Case'} schedule (same id).`);
+      const stored = String(doc['name'] ?? '');
+      if (target && changes.name === undefined && /schedule(?: \d+)?$/i.test(stored) && /^[A-Z]{2,}[-_]\d+ schedule/i.test(stored)) {
+        notes.push(`Its name is still "${stored}" — pass \`name\` to rename it for ${target.code}.`);
+      }
+    }
+    // release / sprint (a suite schedule needs a release)
+    if (changes.releaseId !== undefined || changes.sprintId !== undefined) {
+      const plan = await this.resolveTaskPlanning(changes.releaseId, changes.sprintId);
+      if (plan.releaseId !== undefined) patch['releaseId'] = plan.releaseId;
+      if (plan.iterationId !== undefined) patch['iterationId'] = plan.iterationId;
+    }
+    const finalType = String(patch['schedulerType'] ?? doc['schedulerType'] ?? '');
+    const finalRelease = 'releaseId' in patch ? patch['releaseId'] : doc['releaseId'];
+    if (target?.type === 'SU' && (finalRelease === null || finalRelease === undefined || finalRelease === 0)) {
+      throw new Error('A suite schedule needs a release (the Scheduler marks Release as required for a suite) — pass releaseId (id, code or name).');
+    }
+    if (changes.browser && doc['schedulerType'] === 'TC' && finalType === 'TC' && !('platForm' in patch)) {
       const b = sqaBrowser(changes.browser);
       patch['platForm'] = [{ id: b, name: b, type: 'NONE', technologyType: 'WEB' }];
     }
     if (changes.environmentId) patch['environment'] = await this.environmentKey(changes.environmentId);
     if (changes.agentId) patch['agentId'] = [changes.agentId];
     if (changes.mode) patch['executionMode'] = changes.mode;
-    return this.putSchedule(doc, patch);
+    let newName: string | undefined;
+    if (changes.name !== undefined) {
+      newName = this.checkScheduleName(changes.name, await this.scheduleNames(), String(doc['id']));
+      if (newName !== String(doc['name'] ?? '')) patch['name'] = newName; else newName = undefined;
+    }
+    let ref: ScheduleRef;
+    try {
+      ref = await this.putSchedule(doc, patch);
+    } catch (e) {
+      throw (newName ? this.scheduleNameError(e, newName) : undefined) ?? e;
+    }
+    const after = newName !== undefined || target ? await this.readOwnSchedule(String(doc['id'])) : undefined;
+    if (after && newName !== undefined && String(after['name'] ?? '') !== newName) {
+      throw new Error(`The schedule was sent the name "${newName}" but reads back as "${String(after['name'] ?? '')}".`);
+    }
+    if (after && target && (String(after['schedulerType'] ?? '') !== target.type || Number(after['parentId']) !== target.id)) {
+      throw new Error(`The schedule was pointed at ${target.type} ${target.id} (${target.code}) but reads back as ${String(after['schedulerType'] ?? '')} ${String(after['parentId'] ?? '')}.`);
+    }
+    return { ...ref, ...(newName !== undefined ? { name: newName } : {}), ...(notes.length ? { notes } : {}) };
   }
 
   async controlSchedule(scheduleId: string, action: ScheduleAction): Promise<ScheduleRef> {
@@ -7064,7 +8973,7 @@ export class SimplifyQaAdapter {
         );
       }
       if (rows.defaultIterationId && String(row.id) === String(rows.defaultIterationId)) {
-        throw new Error(`"${row.name || row.id}" is the DEFAULT iteration and cannot be deleted.`);
+        throw new Error(`"${row.name || row.id}" is the DEFAULT iteration and cannot be deleted. Make another iteration the default first (testdata_set_default_iteration), then delete it.`);
       }
       if (!targets.includes(String(row.id))) targets.push(String(row.id));
     }
@@ -7080,6 +8989,65 @@ export class SimplifyQaAdapter {
     });
     const after = await this.testdataRowsFor(td, q.entityType, q.id, q.environmentType);
     return { deleted: targets, rows: after };
+  }
+
+  /** Make one iteration row the DEFAULT of an environment — the row a run executes — for a test case, function or suite. The default is not a flag
+   *  on the row: it is `defaultIteration` on the test data DEFINITION, a map of environment → iteration id, saved through the same update the test data page
+   *  uses (`PUT /tm/testdata/update`, which also records the change). That update takes at least one row (the backend reads the project from it) and
+   *  the definition's NUMERIC id, so the chosen row goes back unchanged. Other environments' defaults are kept, a stale version is retried once, and the
+   *  test data is read again to confirm the new default. */
+  async setDefaultTestdataIteration(q: {
+    entityType: 'TC' | 'FN' | 'SU'; id: string; environmentType: string; iteration: string;
+  }): Promise<{ iteration: string; previous?: string; changed: boolean; rows: TestdataRows }> {
+    const projectId = this.requireProjectId();
+    const key = String(q.iteration ?? '').trim();
+    if (!key) throw new Error('iteration is required — the iteration name (e.g. "ITR-2") or id to make the default.');
+    let td = await this.testdataDefinitionRow(q.entityType, q.id);
+    let rows = await this.testdataRowsFor(td, q.entityType, q.id, q.environmentType);
+    const row = rows.iterations.find((r) => r.name === key)
+      ?? rows.iterations.find((r) => r.name.trim().toLowerCase() === key.toLowerCase())
+      ?? rows.iterations.find((r) => String(r.id) === key);
+    if (!row) {
+      throw new Error(`No iteration "${key}" on ${q.entityType} ${q.id} in environment "${rows.environmentType}". Rows: ${rows.iterations.map((r) => r.name || r.id).join(', ') || '(none)'}.`);
+    }
+    const previousRow = rows.defaultIterationId ? rows.iterations.find((r) => String(r.id) === String(rows.defaultIterationId)) : undefined;
+    const previous = previousRow ? (previousRow.name || previousRow.id) : undefined;
+    if (String(row.id) === String(rows.defaultIterationId ?? '')) {
+      return { iteration: row.name || row.id, ...(previous ? { previous } : {}), changed: false, rows };
+    }
+
+    const env = rows.environmentType;
+    const stripped: Record<string, any> = JSON.parse(JSON.stringify(row));
+    for (const k of ['_id', '__v', 'customerId', 'deleted', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy', 'fnMap', 'isEdit', 'newIteration', 'showEditMode']) delete stripped[k];
+    stripped['projectId'] = stripped['projectId'] ?? td['projectId'] ?? projectId;
+    const send = (d: Record<string, any>): Promise<unknown> => {
+      const current = d['defaultIteration'];
+      const map: Record<string, unknown> = current && typeof current === 'object' && !Array.isArray(current) ? { ...current } : {};
+      map[env] = String(row.id);
+      const idText = String(d['id']);
+      return this.http.putJson<any>('/tm/testdata/update', {
+        payload: [stripped],
+        testdata: {
+          id: /^\d+$/.test(idText) ? Number(idText) : d['id'], defaultIteration: map,
+          projectId: Number(d['projectId'] ?? projectId), updateVersion: d['updateVersion'] ?? 0,
+        },
+      });
+    };
+    try {
+      await send(td);
+    } catch (e) {
+      if (!/CONCURRENCY|Concurrency Error/i.test(e instanceof Error ? e.message : String(e))) throw e;
+      td = await this.testdataDefinitionRow(q.entityType, q.id);
+      await send(td);
+    }
+
+    const after = await this.testdataDefinitionRow(q.entityType, q.id);
+    rows = await this.testdataRowsFor(after, q.entityType, q.id, q.environmentType);
+    if (String(rows.defaultIterationId ?? '') !== String(row.id)) {
+      const now = rows.defaultIterationId ? rows.iterations.find((r) => String(r.id) === String(rows.defaultIterationId)) : undefined;
+      throw new Error(`Sent "${row.name || row.id}" as the default of ${q.entityType} ${q.id} (env ${env}), but SimplifyQA still shows "${now ? (now.name || now.id) : '(none)'}" as the default.`);
+    }
+    return { iteration: row.name || row.id, ...(previous ? { previous } : {}), changed: true, rows };
   }
 
   /** Copy the default-iteration values of one TC onto another, matching parameters BY NAME.   *  Used by tc_automate: a manual TC converted to automated must carry the manual TC's testdata,
@@ -7207,8 +9175,12 @@ export class SimplifyQaAdapter {
         }
         data[idx] = next;
       } else {
+        // `type:'OB'` is what the backend writes on every parameter cell; a cell without it makes the
+        // test-data screen throw "Cannot read properties of undefined (reading 'type')" and the run
+        // end as Not Executed.
         data.push({
           paramId,
+          type: 'OB',
           value: cell.value ?? '',
           ...(cell.formulaValue ? { formulaValue: cell.formulaValue } : {}),
         });
@@ -7224,6 +9196,69 @@ export class SimplifyQaAdapter {
       data,
     });
     return { patched, skipped };
+  }
+
+  /** Find and repair test-data cells that have no `type` in EVERY version of a test case.
+   *  The recorder window's save of a new version adds cells (`{paramId, value}`) to the first test-data
+   *  header it finds for the test case without filtering by version, so either version can end up with
+   *  typeless cells. Such a version cannot load its test data and its runs end Not Executed with no steps.
+   *  Each such cell gets `type:'OB'` plus the stepId / stepSeq of the step that uses the parameter in that
+   *  version; nothing is deleted and no value is touched. */
+  async repairTestdataCells(tcId: string): Promise<{ checked: number; repaired: number; versions: string[] }> {
+    const projectId = this.requireProjectId();
+    const tcNum = Number.parseInt(numericId(tcId), 10);
+    const rawTc = await this.fetchRawTestcase(tcId);
+    const versions: Array<{ id: string; name: string }> = [];
+    for (const v of Array.isArray(rawTc?.versions) ? rawTc.versions : []) {
+      const id = str(v, 'id', '_id');
+      if (id) versions.push({ id, name: str(v, 'name') ?? id });
+    }
+    const fixed: string[] = [];
+    let checked = 0;
+    let repaired = 0;
+    for (const ver of versions) {
+      const search = await this.http.postJson<any>('/tm/testdata/searchItr', {
+        searchFields: [
+          { column: 'testcaseId', value: tcNum, regEx: false },
+          { column: 'versionId', value: ver.id, regEx: false },
+          { column: 'deleted', value: false, regEx: false },
+        ],
+        startIndex: 0,
+        limit: 1000,
+      });
+      const rows = pickArray(search, 'data', 'content', 'iterations');
+      const broken = rows.filter((r: any) => Array.isArray(r?.data)
+        && r.data.some((c: any) => c && typeof c === 'object' && typeof c.type !== 'string'));
+      checked += rows.length;
+      if (!broken.length) continue;
+      const stepOfParam = new Map<number, { stepId: unknown; stepSeq: unknown }>();
+      for (const s of await this.fetchStepsCollection(tcId, rawTc, ver.id)) {
+        if (s?.deleted) continue;
+        for (const pid of [...(s?.objectParameterIds ?? []), ...(s?.parameterIds ?? []), ...(s?.parameterizedParamIds ?? [])]) {
+          if (!stepOfParam.has(Number(pid))) stepOfParam.set(Number(pid), { stepId: s.id, stepSeq: s.seq });
+        }
+      }
+      for (const row of broken) {
+        const customerId = Number(row?.customerId ?? rawTc?.customerId);
+        if (!Number.isFinite(customerId)) continue;
+        const data = row.data.map((c: any) => {
+          if (!c || typeof c !== 'object' || typeof c.type === 'string') return c;
+          const at = stepOfParam.get(Number(c.paramId));
+          return {
+            ...c,
+            type: 'OB',
+            ...(c.stepId === undefined && at?.stepId !== undefined ? { stepId: at.stepId } : {}),
+            ...(c.stepSeq === undefined && at?.stepSeq !== undefined ? { stepSeq: at.stepSeq } : {}),
+          };
+        });
+        await this.http.postJson<any>('/tm/testdata/updateItr', {
+          parentId: row.parentId, id: row.id, customerId, projectId, data,
+        });
+        repaired += data.filter((c: any, i: number) => c !== row.data[i]).length;
+        if (!fixed.includes(ver.name)) fixed.push(ver.name);
+      }
+    }
+    return { checked, repaired, versions: fixed };
   }
 
   /** Environment key: caller wins; else fetch the project's configured envs and pick the first;
@@ -7710,35 +9745,54 @@ export class SimplifyQaAdapter {
     };
   }
 
-  /** Whole-execution failure analysis (executionFailures.ts) for TC-123 / SU-123 / PL-123 or one
-   *  named execution. */
-  async getExecutionFailures(
-    input: import('./failureTypes.js').ExecutionFailureInput,
-  ): Promise<import('./failureTypes.js').ExecutionFailureContext> {
+  /** The failure-analysis engine (executionFailures.ts) bound to this connection. */
+  private failureAnalyzer(): ExecutionFailureAnalysis {
     return new ExecutionFailureAnalysis({
       http: this.http,
       projectId: this.requireProjectId(),
       baseUrl: this.baseUrl(),
       fetchExecDoc: (id, projectId) => this.fetchExecDoc(id, projectId),
       latestExecutionOf: (kind, id) => this.getLatestRunFor(kind, id),
-    }).analyse(input);
+    });
   }
+
+  /** Whole-execution failure analysis (executionFailures.ts) for TC-123 / SU-123 / PL-123 or one
+   *  named execution. */
+  async getExecutionFailures(
+    input: import('./failureTypes.js').ExecutionFailureInput,
+  ): Promise<import('./failureTypes.js').ExecutionFailureContext> {
+    return this.failureAnalyzer().analyse(input);
+  }
+
+  /** Level-1 history of each failed test case in `ctx`, searched across every execution of the test
+   *  case before it — standalone, any suite, any plan (failureHistory.ts). Keyed by
+   *  `executionItemId`; status `unknown` when its run search failed. `cache` (one per analysis)
+   *  makes a test case failing in several executions one search. "Edited since pass" carries
+   *  version names. */
+  async getFailureHistory(
+    ctx: import('./failureTypes.js').ExecutionFailureContext,
+    cache?: import('./failureHistory.js').HistoryCache,
+  ): Promise<Map<string, import('./failureHistory.js').TestcaseHistory>> {
+    const analyzer = this.failureAnalyzer();
+    const history = await analyzer.failureHistory(ctx, cache);
+    await analyzer.nameHistoryVersions(history);
+    return history;
+  }
+
+  /** Level-2: the failing step of `it` as it ran in the last passed run (failureHistory.ts). */
+  async compareWithLastPass(
+    it: import('./failureTypes.js').FailureIteration,
+    history: import('./failureHistory.js').TestcaseHistory,
+    executionItemId: string,
+    rows?: import('./failureHistory.js').StepRowsCache,
+  ): Promise<import('./failureHistory.js').StepComparison | null> {
+    return this.failureAnalyzer().compareWithLastPass(it, history, executionItemId, rows);
+  }
+
 
   /** A failure screenshot as base64 (see executionFailures.fetchFailureImage). */
   async fetchFailureImage(absoluteUrl: string, maxBytes: number): Promise<{ data: string; mimeType: string } | null> {
     return fetchFailureImage(this.http, this.baseUrl(), absoluteUrl, maxBytes);
-  }
-
-  /** The failure-analysis card + evidence text and the top causes' screenshots (failureReport.ts). */
-  async getFailureReport(
-    input: import('./failureTypes.js').ExecutionFailureInput & { includeImages?: boolean },
-  ): Promise<import('./failureReport.js').FailureReport> {
-    const { includeImages, ...analysisInput } = input;
-    const ctx = await this.getExecutionFailures(analysisInput);
-    const images = includeImages === false || input.includeScreenshots === false
-      ? []
-      : await failureImages(ctx, (url, maxBytes) => this.fetchFailureImage(url, maxBytes));
-    return { text: renderExecution(ctx), images };
   }
 
   private baseUrl(): string {
@@ -8833,8 +10887,116 @@ export class SimplifyQaAdapter {
     }
     return out;
   }
-  async listDatasets(tcId?: string): Promise<DatasetInfo[]> {
-    const h = this.hop();
+  /** Raw environment rows of the active project (the rows `/pm/fields/savefields` round-trips). */
+  private async fetchEnvironmentRows(): Promise<Array<Record<string, any>>> {
+    const projectId = this.requireProjectId();
+    const raw = await this.http.getJson<any>(`/pm/fields/8?projectId=${projectId}&fieldType=environment`);
+    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
+    return arr.filter((e: any) => e && typeof e === 'object');
+  }
+
+  /** Persist the project's WHOLE environment list — byte-for-byte what the UI's Environment editor
+   *  posts: `POST /pm/fields/savefields { environment: [...], customlevel: false }`. A new row has an
+   *  empty id; an existing one is edited in place; a deleted one is sent back with `deleted: true`.
+   *  The backend then provisions that environment's test-data rows itself (the UI calls it
+   *  "Test Data environment creation has been initiated"). */
+  private async saveEnvironmentRows(rows: Array<Record<string, any>>): Promise<void> {
+    await this.http.postJson<any>('/pm/fields/savefields', {
+      environment: rows, customlevel: false,
+    });
+  }
+
+  /** The logged-in user's id, as the UI stamps createdBy/updatedBy (0 when it cannot be resolved). */
+  private async environmentActor(): Promise<number> {
+    const id = await this.fetchUserIdFromMe();
+    const n = Number.parseInt(id ?? '', 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  /** The project's customerId — the UI puts it inside the generated environment key. */
+  private async projectCustomerId(projectId: number): Promise<number | undefined> {
+    try {
+      const n = Number((await this.getProjectById(String(projectId)))['customerId']);
+      return Number.isFinite(n) ? n : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Key the UI would generate (`CUSTFIELD_<customerId><name>_<name.length>_<rand5>`). */
+  private newEnvironmentKey(name: string, customerId?: number): string {
+    const rand = Math.random().toString(26).slice(4, 9);
+    return `CUSTFIELD_${customerId ?? ''}${name}_${name.length}_${rand}`;
+  }
+
+  /** Create an ENVIRONMENT (project configuration > Environments) and return it as saved. */
+  async createEnvironment(input: { name: string; key?: string }): Promise<{ id: string; key: string; name: string }> {
+    const projectId = this.requireProjectId();
+    const name = (input.name ?? '').trim();
+    if (!name) throw new Error('createEnvironment: name is required.');
+    const rows = await this.fetchEnvironmentRows();
+    if (rows.some((r) => String(r['name'] ?? '').trim().toLowerCase() === name.toLowerCase())) {
+      throw new Error(`An environment named "${name}" already exists in this project. Use action:"update" to change it.`);
+    }
+    const key = (input.key ?? '').trim() || this.newEnvironmentKey(name, await this.projectCustomerId(projectId));
+    if (rows.some((r) => String(r['key'] ?? '').trim() === key)) {
+      throw new Error(`Environment key "${key}" is already used in this project — pass a different key.`);
+    }
+    // Same row the UI's "Add environment" form produces (createdBy/updatedBy = the logged-in user).
+    const actor = await this.environmentActor();
+    const row: Record<string, any> = {
+      id: '', name, key, parentId: 8, deleted: false, fieldType: 'environment', projectId,
+      createdBy: actor, updatedBy: actor,
+    };
+    await this.saveEnvironmentRows([...rows, row]);
+    // Prove it: read the list back (the save answer alone is not enough — the UI re-reads too).
+    const saved = (await this.listEnvironments()).find((e) => e.key === key || e.name.toLowerCase() === name.toLowerCase());
+    if (!saved) throw new Error(`Saved environment "${name}" but it is not in the project's environment list on read-back.`);
+    return { id: saved.id, key: saved.key ?? key, name: saved.name };
+  }
+
+  /** Rename / re-key an EXISTING environment. `ref` is its name or key. */
+  async updateEnvironment(ref: string, patch: { name?: string; key?: string }): Promise<{ id: string; key: string; name: string }> {
+    const want = (ref ?? '').trim().toLowerCase();
+    if (!want) throw new Error('updateEnvironment: the environment name or key is required.');
+    const rows = await this.fetchEnvironmentRows();
+    const row = rows.find((r) => String(r['name'] ?? '').trim().toLowerCase() === want || String(r['key'] ?? '').trim().toLowerCase() === want);
+    if (!row) throw new Error(`No environment named or keyed "${ref}" in this project.`);
+    const nextName = (patch.name ?? String(row['name'] ?? '')).trim();
+    if (!nextName) throw new Error('updateEnvironment: name cannot be empty.');
+    if (rows.some((r) => r !== row && String(r['name'] ?? '').trim().toLowerCase() === nextName.toLowerCase())) {
+      throw new Error(`Another environment is already named "${nextName}".`);
+    }
+    const nextKey = (patch.key ?? String(row['key'] ?? '')).trim() || this.newEnvironmentKey(nextName);
+    if (rows.some((r) => r !== row && String(r['key'] ?? '').trim() === nextKey)) {
+      throw new Error(`Another environment already uses the key "${nextKey}".`);
+    }
+    const updated = { ...row, name: nextName, key: nextKey, updatedBy: await this.environmentActor() };
+    await this.saveEnvironmentRows(rows.map((r) => (r === row ? updated : r)));
+    const saved = (await this.listEnvironments()).find((e) => e.key === nextKey || e.name.toLowerCase() === nextName.toLowerCase());
+    if (!saved) throw new Error(`Saved environment "${nextName}" but it is not in the project's environment list on read-back.`);
+    return { id: saved.id, key: saved.key ?? nextKey, name: saved.name };
+  }
+
+  /** Delete an environment the way the UI does: mark the row `deleted:true` and send the list back.
+   *  The default `general` environment is refused. */
+  async deleteEnvironment(ref: string): Promise<{ id: string; name: string; key: string }> {
+    const want = (ref ?? '').trim().toLowerCase();
+    if (!want) throw new Error('deleteEnvironment: the environment name or key is required.');
+    const rows = await this.fetchEnvironmentRows();
+    const row = rows.find((r) => String(r['name'] ?? '').trim().toLowerCase() === want || String(r['key'] ?? '').trim().toLowerCase() === want);
+    if (!row) throw new Error(`No environment named or keyed "${ref}" in this project.`);
+    const key = String(row['key'] ?? '');
+    const name = String(row['name'] ?? '');
+    if (key === 'general') throw new Error('The default "General" environment cannot be deleted.');
+    const gone = { ...row, deleted: true, updatedBy: await this.environmentActor() };
+    await this.saveEnvironmentRows([...rows.filter((r) => r !== row), gone]);
+    const still = (await this.listEnvironments()).some((e) => e.id === String(row['id']) || e.name.toLowerCase() === name.toLowerCase());
+    if (still) throw new Error(`SimplifyQA answered OK but "${name}" is still in the environment list — nothing was deleted.`);
+    return { id: String(row['id']), name, key };
+  }
+
+  async listDatasets(tcId?: string): Promise<DatasetInfo[]> {    const h = this.hop();
     return h?.listDatasets ? h.listDatasets(tcId) : [];
   }
 
@@ -8933,6 +11095,8 @@ export class SimplifyQaAdapter {
           steps[i] = {
             ...cur, ...patch,
             ...(patch.flags ? { flags: { ...cur.flags, ...patch.flags } } : {}),
+            // a controlFlow patch (e.g. just a new condition) keeps the saved kind / block id
+            ...(patch.controlFlow ? { controlFlow: { ...cur.controlFlow, ...patch.controlFlow } } : {}),
             // api edits (assertions, URL, headers, body) change the saved request in place instead of replacing it
             ...(patch.api ? { api: mergeApiPatch(cur, patch) } : {}),
             // A patch that names an object but gives no id means "use THAT object": keeping the saved id (as a plain merge does)

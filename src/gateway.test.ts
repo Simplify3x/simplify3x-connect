@@ -59,6 +59,32 @@ async function start(
   return { base: `http://127.0.0.1:${port}`, stop };
 }
 
+describe('HTTP gateway: caller-chosen output folders', () => {
+  const allowOf = async (env: NodeJS.ProcessEnv, opts: Parameters<typeof createGatewayApp>[1] = {}) => {
+    const created: ServerDeps[] = [];
+    const { base, stop } = await start(env, { ...opts, onSessionCreated: (_id, deps) => created.push(deps) });
+    try {
+      const c = client(base);
+      await c.rpc(init);
+      await c.close();
+      return created[0]!.allowOutDir;
+    } finally {
+      await stop();
+    }
+  };
+
+  it('allowed when bound to loopback (default), refused when bound to all interfaces', async () => {
+    expect(await allowOf({})).toBe(true);
+    expect(await allowOf({ HOST: '127.0.0.1' })).toBe(true);
+    expect(await allowOf({ HOST: '0.0.0.0' })).toBe(false);
+  });
+
+  it('an explicit mount option wins', async () => {
+    expect(await allowOf({ HOST: '0.0.0.0' }, { allowOutDir: true })).toBe(true);
+    expect(await allowOf({}, { allowOutDir: false })).toBe(false);
+  });
+});
+
 describe('HTTP gateway', () => {
   it('serves liveness and readiness without a session', async () => {
     const { base, stop } = await start();
@@ -199,6 +225,153 @@ describe('HTTP gateway', () => {
       expect(res.status).toBe(413);
     } finally {
       await stop();
+    }
+  });
+});
+
+/** Restore process.env IN PLACE. Reassigning `process.env` swaps in a plain object that Node's own
+ *  readers (os.homedir() reads HOME) no longer see, so later env changes would silently not apply. */
+function restoreEnv(saved: NodeJS.ProcessEnv): void {
+  for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+  Object.assign(process.env, saved);
+}
+
+describe('per-user mode (QA_MCP_REQUIRE_CLIENT_TOKEN=true)', () => {
+  const saved = { ...process.env };
+  afterEach(() => restoreEnv(saved));
+
+  /** A stand-in SimplifyQA backend that records the Authorization header of every call it gets. */
+  async function fakeBackend(): Promise<{ url: string; seen: string[]; stop: () => Promise<void> }> {
+    const { createServer } = await import('node:http');
+    const seen: string[] = [];
+    const srv = createServer((req, res) => {
+      seen.push(String(req.headers.authorization ?? ''));
+      res.writeHead(401, { 'content-type': 'application/json' }).end('{}');
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+    const { port } = srv.address() as AddressInfo;
+    return { url: `http://127.0.0.1:${port}`, seen, stop: () => new Promise((r) => srv.close(() => r())) };
+  }
+
+  const until = async (cond: () => boolean): Promise<void> => {
+    for (let i = 0; i < 50 && !cond(); i++) await new Promise((r) => setTimeout(r, 40));
+  };
+
+  it('calls the backend with the caller\'s token, never the server token, and ignores a caller-supplied URL', async () => {
+    const backend = await fakeBackend();
+    Object.assign(process.env, {
+      QA_MCP_PROVIDER: 'simplifyqa',
+      QA_BASE_URL: backend.url,
+      QA_MCP_TOKEN: 'service-token-xyz',
+      QA_MCP_REQUIRE_CLIENT_TOKEN: 'true',
+    });
+    delete process.env['QA_MCP_URL'];
+    const sessions: ServerDeps[] = [];
+    const { base, stop } = await start(process.env, { onSessionCreated: (_id, deps) => sessions.push(deps) });
+    try {
+      // The caller also tries to redirect the server elsewhere; that header must be ignored.
+      const userB = client(base, { authorization: 'Bearer user-b-token', 'x-qa-base-url': 'http://127.0.0.1:9' });
+      expect((await userB.rpc(init)).status).toBe(200);
+      await until(() => backend.seen.length > 0);
+
+      expect(sessions[0]?.connection?.describe().mode).toBe('offline'); // never connected as the server
+      expect(backend.seen.length).toBeGreaterThan(0); // reached OUR backend, not the caller's URL
+      expect(backend.seen.every((h) => h === 'Bearer user-b-token')).toBe(true);
+      await userB.close();
+    } finally {
+      await stop();
+      await backend.stop();
+    }
+  });
+
+  it('boots with a base URL and no server token, and refuses to boot without a base URL', async () => {
+    const { resolveConfig } = await import('./config.js');
+    const env = { QA_MCP_PROVIDER: 'simplifyqa', QA_MCP_REQUIRE_CLIENT_TOKEN: 'true' };
+    const cfg = resolveConfig({ ...env, QA_BASE_URL: 'https://sqa.example.com', QA_MCP_USER_ID: '7' });
+    expect(cfg.mode).toBe('offline');
+    expect(cfg.baseUrl).toBe('https://sqa.example.com');
+    expect(cfg.token).toBeUndefined();
+    // Every session copies this config, so a server userId would make every caller user 7.
+    expect(cfg.userId).toBeUndefined();
+    expect(() => resolveConfig(env)).toThrow(/needs QA_BASE_URL/);
+  });
+});
+
+describe('session isolation on a shared server (QA_MCP_HOSTED=true)', () => {
+  const saved = { ...process.env };
+  afterEach(() => restoreEnv(saved));
+
+  it('gives each session its own drafts, with ids that cannot be guessed', async () => {
+    process.env['QA_MCP_HOSTED'] = 'true';
+    const sessions: ServerDeps[] = [];
+    const { base, stop } = await start({}, { onSessionCreated: (_id, deps) => sessions.push(deps) });
+    try {
+      const a = client(base);
+      const b = client(base);
+      await a.rpc(init);
+      await b.rpc(init);
+      const id = sessions[0]!.drafts!.create({ title: 'A only', category: 'automated', steps: [] } as never);
+      expect(id).toMatch(/^draft_[0-9a-f-]{36}$/);
+      expect(sessions[0]!.drafts!.get(id).tc.title).toBe('A only');
+      expect(() => sessions[1]!.drafts!.get(id)).toThrow();
+      await a.close();
+      await b.close();
+    } finally {
+      await stop();
+    }
+  });
+
+  it('without QA_MCP_HOSTED, sessions share one draft store as before', async () => {
+    delete process.env['QA_MCP_HOSTED'];
+    const sessions: ServerDeps[] = [];
+    const { base, stop } = await start({}, { onSessionCreated: (_id, deps) => sessions.push(deps) });
+    try {
+      const a = client(base);
+      const b = client(base);
+      await a.rpc(init);
+      await b.rpc(init);
+      const id = sessions[0]!.drafts!.create({ title: 'shared', category: 'automated', steps: [] } as never);
+      expect(sessions[1]!.drafts!.get(id).tc.title).toBe('shared');
+      await a.close();
+      await b.close();
+    } finally {
+      await stop();
+    }
+  });
+
+  it.each([
+    ['does not restore a project another session chose', 'true', ''],
+    ['without QA_MCP_HOSTED, still restores the last project as before', '', '42'],
+  ])('%s', async (_name, hostedFlag, expectedProject) => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-home-'));
+    fs.mkdirSync(path.join(home, '.common-qa-mcp'));
+    fs.writeFileSync(path.join(home, '.common-qa-mcp', 'last-project.json'), JSON.stringify({ 'https://sqa.example.com': '42' }));
+    // Jest hands tests a COPY of process.env, so HOME would not reach os.homedir(); stub it instead.
+    const homedir = jest.spyOn(os.default, 'homedir').mockReturnValue(home);
+    Object.assign(process.env, {
+      QA_MCP_PROVIDER: 'simplifyqa',
+      QA_BASE_URL: 'https://sqa.example.com',
+      QA_MCP_TOKEN: 'service-token-xyz',
+      QA_MCP_HOSTED: hostedFlag,
+    });
+    delete process.env['QA_MCP_URL'];
+    delete process.env['QA_MCP_PROJECT_ID'];
+    delete process.env['QA_MCP_REQUIRE_CLIENT_TOKEN'];
+    const sessions: ServerDeps[] = [];
+    const { base, stop } = await start({}, { onSessionCreated: (_id, deps) => sessions.push(deps) });
+    try {
+      const a = client(base);
+      await a.rpc(init);
+      expect(sessions[0]!.connection!.describe().mode).toBe('connected');
+      expect(sessions[0]!.connection!.describe().projectId ?? '').toBe(expectedProject);
+      await a.close();
+    } finally {
+      await stop();
+      homedir.mockRestore();
+      fs.rmSync(home, { recursive: true, force: true });
     }
   });
 });

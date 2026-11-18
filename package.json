@@ -1,9 +1,9 @@
 {
   "name": "simplify3x-connect",
-  "version": "0.28.1",
+  "version": "0.31.0",
   "mcpName": "com.simplifyqa/simplify3x-connect",
   "type": "module",
-  "description": "Simplify3x Connect: one product-neutral MCP for the QA test-case lifecycle. Drives SimplifyQA or Walnut from any AI client over stdio or HTTP.",
+  "description": "Simplify3x Connect: one product-neutral MCP for the QA test-case lifecycle. Drives SimplifyQA from any AI client over stdio or HTTP.",
   "bin": {
     "simplify3x-connect": "dist/cli.js",
     "common-qa-mcp": "dist/cli.js"
@@ -27,10 +27,10 @@
     "testing",
     "test-automation",
     "test-cases",
-    "walnut",
     "simplifyqa",
     "ai-agent"
   ],
+  "homepage": "https://github.com/Simplify3x/simplify3x-connect#readme",
   "engines": {
     "node": ">=20"
   },
@@ -44,21 +44,23 @@
     "start:http": "node dist/httpMain.js",
     "version": "node scripts/sync-version.mjs && git add src/version.ts",
     "sync-version": "node scripts/sync-version.mjs",
-    "prebuild": "node scripts/sync-version.mjs"
+    "prebuild": "node scripts/sync-version.mjs",
+    "test:coverage": "jest --coverage"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.22.0",
     "express": "^5.1.0",
+    "pdfkit": "^0.20.2",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/express": "^5.0.4",
     "@types/jest": "^30.0.0",
     "@types/node": "^20.19.42",
+    "@types/pdfkit": "^0.17.7",
     "jest": "^30.3.0",
     "ts-jest": "^29.4.9",
     "tsx": "^4.7.0",
     "typescript": "^5.4.2"
-  },
-  "homepage": "https://github.com/Simplify3x/simplify3x-connect#readme"
+  }
 }

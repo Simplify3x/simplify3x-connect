@@ -10,6 +10,7 @@ import { createAdapter } from './adapters/factory.js';
 import { resolveConfig } from './config.js';
 import { connectionFromRequest } from './requestConnection.js';
 import { log } from './log.js';
+import { resolveHosted, resolveMaxBodyBytes, resolveMaxSessions, resolveSessionTtlMs } from './defaults.js';
 
 export type MountedStatus = {
   mode: 'offline' | 'connected';
@@ -26,6 +27,8 @@ export type MountOptions = {
   maxSessions?: number;
   /** Maximum accepted request body, bytes. Default 1 MB. */
   maxBodyBytes?: number;
+  /** Whether a caller may choose an export `outDir` (see ServerDeps.allowOutDir). Default true. */
+  allowOutDir?: boolean;
 };
 
 /**
@@ -40,15 +43,20 @@ export type MountOptions = {
  * state is what lets each MCP session carry its own token, and what makes `qa_connect` affect only
  * the caller.
  *
- * The DraftStore stays shared on purpose: a draft must survive a client reconnect.
+ * Drafts and the remembered project depend on QA_MCP_HOSTED. Off (default, unchanged behaviour): one
+ * draft store shared by all sessions, so a draft survives a client reconnect, and the last-selected
+ * project is restored. On (a shared deployment): each session has its own drafts, so no user can open
+ * another's, and nothing project-related is remembered, so no session inherits another user's project.
+ * The cost there: an unsaved draft does not survive a NEW session; saved test cases live in the product.
  */
 export function mountQaMcp(app: Express, options: MountOptions = {}): MountedStatus {
   const bootConfig = resolveConfig(process.env);
-  const drafts = new DraftStore();
+  const hosted = resolveHosted();
+  const sharedDrafts = new DraftStore();
 
-  const SESSION_TTL_MS = options.sessionTtlMs ?? Number(process.env['QA_MCP_SESSION_TTL_MS'] ?? 30 * 60 * 1000);
-  const MAX_SESSIONS = options.maxSessions ?? Number(process.env['QA_MCP_MAX_SESSIONS'] ?? 200);
-  const MAX_BODY_BYTES = options.maxBodyBytes ?? Number(process.env['QA_MCP_MAX_BODY_BYTES'] ?? 1_000_000);
+  const SESSION_TTL_MS = options.sessionTtlMs ?? resolveSessionTtlMs();
+  const MAX_SESSIONS = options.maxSessions ?? resolveMaxSessions();
+  const MAX_BODY_BYTES = options.maxBodyBytes ?? resolveMaxBodyBytes();
 
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const lastSeen = new Map<string, number>();
@@ -60,13 +68,14 @@ export function mountQaMcp(app: Express, options: MountOptions = {}): MountedSta
     const cfg = resolveConfig(process.env);
     return {
       adapter: createAdapter(cfg),
-      connection: new QaConnection(cfg),
+      connection: new QaConnection(cfg, !hosted),
       mode: cfg.mode,
-      drafts,
+      drafts: hosted ? new DraftStore() : sharedDrafts,
       walnutUiOrigin: cfg.walnutUiOrigin,
       agentUrl: cfg.agentUrl,
       // The standalone gateway has no Electron window -- tc_draft_open just returns the editor link.
       openEditorWindow: async () => false,
+      allowOutDir: options.allowOutDir !== false,
     };
   }
 

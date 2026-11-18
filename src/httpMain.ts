@@ -13,9 +13,10 @@
  * express.json() is added here.
  */
 import { createGatewayApp, announce } from './gateway.js';
+import { resolveHost, resolvePort } from './defaults.js';
 
-const PORT = Number(process.env['PORT'] ?? 4060);
-const HOST = process.env['HOST'] ?? '127.0.0.1';
+const PORT = resolvePort();
+const HOST = resolveHost();
 
 const gateway = createGatewayApp();
 

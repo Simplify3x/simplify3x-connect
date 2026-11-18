@@ -22,7 +22,10 @@ type PlanWrites = {
   addPlanEntries: (id: string, input: PlanEntryInput) => Promise<{ added: string[]; skipped: Array<{ code: string; reason: string }> }>;
   planEntriesRemovePreview: (id: string, tcIds: string[]) => Promise<{ plan: SuiteRef; entries: PlanEntryRef[] }>;
   removePlanEntries: (id: string, tcIds: string[]) => Promise<{ removed: number; notRemoved: string[] }>;
-  startExecutionPlanRun: (id: string, opts: { agentId?: string }) => Promise<PlanRunRef>;
+  startExecutionPlanRun: (id: string, opts: { agentId?: string; mode?: 'local' | 'remote' | 'cloud' | 'stack' }) => Promise<PlanRunRef>;
+  configurePlanStacks: (id: string, opts: { count: number; mode?: 'CLOUD' | 'LOCAL'; browser?: string }) => Promise<{
+    created: boolean; cloudAvailable?: boolean; stacks: Array<{ id: string; name: string; mode: string; codes: string[] }>;
+  }>;
 };
 
 const NOT_CONNECTED =
@@ -63,15 +66,20 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
         '`assignTo` (user id or "me") and `assignDate` (YYYY-MM-DD); only assigned test cases can run. Duplicates are skipped.\n' +
         '- action:"remove_testcases" — needs `planId` and `tcIds`. TWO-STEP like delete: removing also DELETES those ' +
         'test cases\' run history in SimplifyQA, which cannot be undone.\n' +
+        '- action:"stack_setup" — needs `planId` and `stacks` (how many, e.g. 2). Saves the plan\'s Stack Setup (what the UI\'s Stack tab saves) and ' +
+        'AUTO-DISTRIBUTES its automation test cases across the stacks, round-robin. Optional `stackMode` ("cloud" default | "local") and `browser`.\n' +
         '- action:"run" — needs `planId`; call ONLY when the user explicitly asked to run this plan. It runs NOW — SimplifyQA cannot schedule an ' +
-        'execution plan (its Scheduler takes a test case or a suite). Runs LOCALLY on this ' +
-        'machine\'s SimplifyQA agent (SimplifyQA runs plans locally; the agent must be running). Runs the assigned, ' +
-        'non-blocked AUTOMATION test cases and says which were left out. Optional `agentId` (this machine\'s, see ' +
-        'local_agents). Then track it with run_status({ runId }).\n' +
+        'execution plan (its Scheduler takes a test case or a suite). `mode`: "local" (default — this machine\'s agent, which must be running), ' +
+        '"remote" (another machine\'s agent: pass `agentId`), "cloud" (the project\'s cloud machine) or "stack" (the saved Stack Setup, ' +
+        'divided across its stacks; only the stacks holding test cases assigned to the person running it execute). Runs the assigned, ' +
+        'non-blocked AUTOMATION test cases and says which were left out. Then track it with run_status({ runId }) — it lists each test case.\n' +
         'A plan in review or approval (REVIEW PENDING, APPROVE PENDING, REVIEWED, APPROVED) is read-only, as in SimplifyQA.',
       inputSchema: {
-        action: z.enum(['create', 'update', 'delete', 'add_testcases', 'remove_testcases', 'run']).describe('What to do.'),
-        mode: z.enum(['local', 'remote', 'cloud']).optional().describe('run: only "local" is supported for plans.'),
+        action: z.enum(['create', 'update', 'delete', 'add_testcases', 'remove_testcases', 'run', 'stack_setup']).describe('What to do.'),
+        mode: z.enum(['local', 'remote', 'cloud', 'stack']).optional().describe('run: "local" (this machine\'s agent), "cloud" (a configured cloud machine), or "stack" (the saved stack setup, divided across its stacks).'),
+        stacks: z.number().int().min(1).optional().describe('stack_setup: how many stacks to create (e.g. 2).'),
+        stackMode: z.enum(['cloud', 'local']).optional().describe('stack_setup: what each stack runs on (default cloud).'),
+        browser: z.string().optional().describe('stack_setup: browser for WEB test cases (default chrome).'),
         agentId: z.string().optional().describe('run: this machine\'s agent id (optional; auto-picked, see local_agents).'),
         when: z.enum(['immediate', 'schedule']).optional().describe('run: only "immediate" — execution plans cannot be scheduled in SimplifyQA.'),
         planId: z.string().optional().describe('Every action except create: plan id or code (PL-5).'),
@@ -130,17 +138,38 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
           await adapter.updateExecutionPlan(planId, fields);
           return ok(`Updated execution plan ${planId}.`);
         }
+        if (action === 'stack_setup') {
+          if (!adapter.configurePlanStacks) return err('execution_plan stack_setup is not available on this connection.');
+          if (!planId) return err('execution_plan action:"stack_setup" needs: planId and stacks.');
+          if (!args.stacks || args.stacks < 1) return err('execution_plan action:"stack_setup" needs: stacks (how many, at least 1).');
+          const res = await adapter.configurePlanStacks(planId, {
+            count: args.stacks,
+            ...(args.stackMode ? { mode: args.stackMode === 'cloud' ? 'CLOUD' as const : 'LOCAL' as const } : {}),
+            ...(args.browser ? { browser: args.browser } : {}),
+          });
+          return ok(
+            `${res.created ? 'Saved' : 'Updated'} the stack setup for ${planId}: ${res.stacks.length} stack(s).\n` +
+              res.stacks.map((s) => `  • ${s.name} [${s.mode}] — ${s.codes.join(', ') || '(no test cases)'}`).join('\n') +
+              '\nTest cases were distributed across the stacks (round-robin). Run it with mode:"stack".' +
+              (res.cloudAvailable === false
+                ? '\n⚠️ This project has no cloud machine configured, so CLOUD stacks cannot run yet — add one in the project settings, or redo stack_setup with stackMode:"local".'
+                : ''),
+            res as unknown as Record<string, unknown>,
+          );
+        }
         if (action === 'run') {
           if (!planId) return err('execution_plan action:"run" needs: planId.');
-          if (args.mode && args.mode !== 'local') {
-            return err('SimplifyQA runs execution plans locally — run it with mode "local" on a machine with the SimplifyQA agent.');
-          }
+          const mode = (args.mode ?? 'local') as 'local' | 'remote' | 'cloud' | 'stack';
           if (args.when === 'schedule') {
             return err('SimplifyQA\'s Scheduler only schedules a test case or a suite — run the plan now, or schedule its test cases / a suite instead.');
           }
-          const run = await adapter.startExecutionPlanRun(planId, { ...(args.agentId ? { agentId: args.agentId } : {}) });
+          const run = await adapter.startExecutionPlanRun(planId, {
+            mode,
+            ...(args.agentId ? { agentId: args.agentId } : {}),
+          });
+          const where = mode === 'local' ? 'locally' : mode === 'remote' ? `on remote agent ${args.agentId}` : mode === 'cloud' ? 'on the cloud' : 'with its stack setup';
           const lines = [
-            `Started ${planId} locally — run ${run.runId} with ${run.started.length} test case${run.started.length === 1 ? '' : 's'}: ${run.started.join(', ')}.`,
+            `Started ${planId} ${where} — run ${run.runId} with ${run.started.length} test case${run.started.length === 1 ? '' : 's'}: ${run.started.join(', ')}.`,
             ...(run.skipped.length ? [`Not run: ${run.skipped.map((s) => `${s.code} (${s.reason})`).join(', ')}.`] : []),
             `Track it with run_status({ runId: "${run.runId}" }).`,
           ];

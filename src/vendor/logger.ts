@@ -1,10 +1,8 @@
 /**
- * Simple logger utility for Walnut Agent
- * Logs to console AND to a file for easy review.
+ * Simple logger utility: always console, optionally a file.
  *
- * Log file location (in order of priority):
- *   1. WALNUT_LOG_FILE env var (absolute or relative path)
- *   2. Default: ./logs/walnut-agent.log (relative to process.cwd())
+ * File logging is OFF unless QA_MCP_LOG_FILE names a path (absolute or relative). WALNUT_LOG_FILE is
+ * still read as a fallback for existing deployments. Every line passes through credential redaction.
  *
  * The log file is created automatically. Logs are appended on each run.
  */
@@ -63,8 +61,15 @@ function ensureLogFile(): string | null {
   logFileReady = true;
 
   try {
-    const envPath = process.env['WALNUT_LOG_FILE'];
-    logFilePath = envPath || path.join(process.cwd(), 'logs', 'walnut-agent.log');
+    // File logging is OPT-IN. A server should not create files on disk unless it is asked to, and
+    // the old default (./logs/walnut-agent.log) both polluted a container's filesystem and carried a
+    // legacy name. Set QA_MCP_LOG_FILE to enable it; the old variable is still accepted.
+    const envPath = (process.env['QA_MCP_LOG_FILE'] ?? process.env['WALNUT_LOG_FILE'] ?? '').trim();
+    if (!envPath) {
+      logFilePath = null;
+      return null;
+    }
+    logFilePath = envPath;
 
     // Ensure directory exists
     const dir = path.dirname(logFilePath);
@@ -73,7 +78,7 @@ function ensureLogFile(): string | null {
     }
 
     // Write a session separator on startup
-    const separator = `\n${'='.repeat(80)}\n  Walnut Agent Log — Session started at ${new Date().toISOString()}\n${'='.repeat(80)}\n\n`;
+    const separator = `\n${'='.repeat(80)}\n  Simplify3x Connect Log — Session started at ${new Date().toISOString()}\n${'='.repeat(80)}\n\n`;
     fs.appendFileSync(logFilePath, separator, 'utf8');
 
     return logFilePath;

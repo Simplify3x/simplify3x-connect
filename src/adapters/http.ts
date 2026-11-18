@@ -1,4 +1,5 @@
 import { log } from '../log.js';
+import { resolveHttpTimeoutMs } from '../defaults.js';
 
 // First N characters of a non-2xx response body kept on the thrown error -- enough
 // for a caller to show useful diagnostic text without risking logging/echoing an
@@ -9,8 +10,8 @@ const BODY_SNIPPET_LEN = 500;
 // external DATA_GENERATION_URL proxy behind /tm/customFormula) freezes the whole
 // tool call forever and the MCP client just sits at "in progress". Override with
 // QA_HTTP_TIMEOUT_MS. 30s is generous for slow proxies; individual callers can
-// tighten it later if needed.
-const DEFAULT_TIMEOUT_MS = Number.parseInt(process.env['QA_HTTP_TIMEOUT_MS'] ?? '30000', 10);
+// tighten it later if needed. The value itself lives in defaults.ts (QA_HTTP_TIMEOUT_MS overrides).
+const DEFAULT_TIMEOUT_MS = resolveHttpTimeoutMs();
 
 /**
  * Thrown by every QaHttp method on any non-2xx response. Downstream adapters branch

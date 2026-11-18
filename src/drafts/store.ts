@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Step, TestCase } from '../domain/types.js';
 import { normalizeParamTokens, normalizeStepProse } from '../paramTokens.js';
 import { duplicateSteps } from './duplicate.js';
@@ -115,10 +116,10 @@ function clamp(n: number, min: number, max: number): number {
  */
 export class DraftStore {
   private readonly drafts = new Map<string, Draft>();
-  private counter = 0;
 
   create(tc: TestCase, sessionId?: string): string {
-    const draftId = `draft_${Date.now().toString(36)}_${(++this.counter).toString(36)}`;
+    // Random, so a draft id cannot be guessed on a shared server.
+    const draftId = `draft_${randomUUID()}`;
     this.drafts.set(draftId, {
       draftId,
       // `${{name}}` tokens are normalised to `${name}` so the editor preview matches what
@@ -216,7 +217,11 @@ function applyOne(tc: TestCase, opItem: DraftOp): TestCase {
       }
       const steps = tc.steps.map((s) => {
         if (s.n !== opItem.n) return s;
-        const next: Step = { ...s, ...opItem.patch, n: s.n, ...(opItem.patch.api ? { api: mergeApiPatch(s, opItem.patch) } : {}) };
+        const next: Step = {
+          ...s, ...opItem.patch, n: s.n,
+          ...(opItem.patch.api ? { api: mergeApiPatch(s, opItem.patch) } : {}),
+          ...(opItem.patch.controlFlow ? { controlFlow: { ...s.controlFlow, ...opItem.patch.controlFlow } } : {}),
+        } as Step;
         // A recorded step pins its action by plugin uniqueId, which the save prefers over the name — so a changed
         // action must drop the old pin, or the new action name is silently ignored.
         if (opItem.patch.actionType !== undefined && opItem.patch.actionUniqueId === undefined) delete next.actionUniqueId;

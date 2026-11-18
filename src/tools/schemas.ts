@@ -32,6 +32,8 @@ export const zCondition = z.object({
   text: z.string().optional(),
   variableName: z.string().optional(),
   variableValue: z.string().optional(),
+  objectName: z.string().optional().describe('An element check by the object\'s name (or give objectId).'),
+  logical: z.enum(['AND', 'OR']).optional().describe('How this check joins the NEXT one when several are given.'),
 });
 
 export const zControlFlow = z.object({
@@ -42,6 +44,8 @@ export const zControlFlow = z.object({
    *  Wide string (not enum) so backend adds don't require a schema change. */
   kind: z.string(),
   condition: zCondition.optional(),
+  /** Several checks, joined by each one's `logical` (AND default). `condition` is the one-check shorthand. */
+  conditions: z.array(zCondition).optional(),
   /** Human-readable expression as the SQA UI shows it (e.g. `count > 5 && status == "active"`).
    *  Emitted as `conditions.ifstring` on the wire. */
   conditionText: z.string().optional(),

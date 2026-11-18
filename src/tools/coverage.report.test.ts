@@ -10,6 +10,7 @@ import type { ProviderAdapter } from '../adapters/types.js';
 import type { Story } from '../domain/types.js';
 import { DraftStore } from '../drafts/store.js';
 import { buildServer } from '../server.js';
+import { resolve as resolvePath } from 'node:path';
 
 type Harness = { client: Client; server: McpServer };
 
@@ -96,6 +97,31 @@ describe('report_download', () => {
     }
   });
 
+  it('on a shared server (QA_MCP_HOSTED=true) returns the report page link and saves nothing', async () => {
+    const saved = process.env['QA_MCP_HOSTED'];
+    process.env['QA_MCP_HOSTED'] = 'true';
+    const downloadReports = jest.fn();
+    const getRun = jest.fn(async () => ({ runId: '42', state: 'passed', reportUrl: 'https://sqa.example.com/user/reports/reports-page?id=42' }));
+    const adapter = { downloadReports, getRun } as unknown as ProviderAdapter;
+    const { client, server } = await connect(adapter);
+    try {
+      const res = await client.callTool({
+        name: 'report_download',
+        arguments: { target: 'testcase', ref: 'TC_123', reportTypes: ['summary'], runId: '42', outDir: '/tmp/qa' },
+      });
+      expect(res.isError).toBeFalsy();
+      expect(downloadReports).not.toHaveBeenCalled();
+      expect(getRun).toHaveBeenCalledWith('42');
+      expect(textOf(res)).toContain('https://sqa.example.com/user/reports/reports-page?id=42');
+      expect(structured<{ reportUrl?: string }>(res).reportUrl).toBe('https://sqa.example.com/user/reports/reports-page?id=42');
+    } finally {
+      if (saved === undefined) delete process.env['QA_MCP_HOSTED'];
+      else process.env['QA_MCP_HOSTED'] = saved;
+      await client.close();
+      await server.close();
+    }
+  });
+
   it('downloads the requested kinds for an explicit execution and reports the files', async () => {
     const downloadReports = jest.fn(async () => ({
       scope: 'testcase' as const,
@@ -118,7 +144,8 @@ describe('report_download', () => {
       });
 
       expect(res.isError).toBeFalsy();
-      expect(downloadReports).toHaveBeenCalledWith({ runId: '42', kinds: ['detailed', 'summary'], outDir: '/tmp/qa' });
+      // outDir is resolved to an absolute path (tools/outDir.ts).
+      expect(downloadReports).toHaveBeenCalledWith({ runId: '42', kinds: ['detailed', 'summary'], outDir: resolvePath('/tmp/qa') });
       expect(textOf(res)).toContain('Generated 2 PDF reports for testcase **TC_123** (Build 42).');
       expect(textOf(res)).toContain('Used execution EX-42 as requested.');
       expect(textOf(res)).toContain('- Detailed report — `/tmp/qa/detailed.pdf` (2 KB)');
@@ -180,48 +207,38 @@ describe('failure_analysis', () => {
     }
   });
 
+  // Failure Analysis v2: the tool drives getExecutionFailures / getFailureHistory (SimplifyQA). The
+  // card, paging, review and inline images are covered in failure.tools.test.ts.
+  const v2Adapter = (getExecutionFailures: jest.Mock) =>
+    ({ getExecutionFailures, getFailureHistory: jest.fn(async () => new Map()) }) as unknown as ProviderAdapter;
+
   it('requires code or executionId before calling the adapter', async () => {
-    const getFailureReport = jest.fn();
-    const adapter = { getFailureReport } as unknown as ProviderAdapter;
-    const { client, server } = await connect(adapter);
+    const getExecutionFailures = jest.fn();
+    const { client, server } = await connect(v2Adapter(getExecutionFailures));
     try {
       const res = await client.callTool({ name: 'failure_analysis', arguments: { includeLogs: true } });
       expect(res.isError).toBe(true);
-      expect(textOf(res)).toContain('Provide `code` (TC-123 / SU-123 / PL-123) or `executionId`');
-      expect(getFailureReport).not.toHaveBeenCalled();
+      expect(textOf(res)).toContain('Provide `code` / `codes` (TC-123 / SU-123 / PL-123) or `executionId`');
+      expect(getExecutionFailures).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();
     }
   });
 
-  it('derives TC-<n> from tcId, forwards the flags and returns the card + inline screenshots', async () => {
-    const getFailureReport = jest.fn(async () => ({
-      text: '### Why TC-123 failed\n\n| step | error |\n|---|---|\n| 3 | timeout |',
-      images: [{ caption: 'Screenshot: step 3', data: 'AAAA', mimeType: 'image/png' }],
-    }));
-    const adapter = { getFailureReport } as unknown as ProviderAdapter;
-    const { client, server } = await connect(adapter);
+  it('derives TC-<n> from tcId and forwards the flags to the analysis', async () => {
+    const getExecutionFailures = jest.fn(async () => { throw new Error('stop after the call'); });
+    const { client, server } = await connect(v2Adapter(getExecutionFailures));
     try {
       const res = await client.callTool({
         name: 'failure_analysis',
         arguments: { tcId: 'TC_123', includeLogs: false, maxLogLines: 12, includeImages: true, includeScreenshots: false },
       });
-
-      expect(res.isError).toBeFalsy();
-      expect(getFailureReport).toHaveBeenCalledWith({
-        code: 'TC-123',
-        includeLogs: false,
-        maxLogLines: 12,
-        includeImages: true,
-        includeScreenshots: false,
-      });
-      expect(textOf(res)).toContain('### Why TC-123 failed');
-      const content = contentOf(res);
-      expect(content.map((c) => c.type)).toStrictEqual(['text', 'text', 'image']);
-      expect(content[1]!.text).toBe('Screenshot: step 3');
-      expect(content[2]!.data).toBe('AAAA');
-      expect(content[2]!.mimeType).toBe('image/png');
+      expect(getExecutionFailures).toHaveBeenCalledWith(expect.objectContaining({
+        code: 'TC-123', includeLogs: false, maxLogLines: 12, includeScreenshots: false,
+      }));
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain('stop after the call');
     } finally {
       await client.close();
       await server.close();

@@ -33,7 +33,7 @@ import type { ProviderAdapter } from './adapters/types.js';
 import type { ConnectedQaConfig, QaConfig } from './config.js';
 import { jwtStringClaim, looksLikeJwt } from './config.js';
 import { readLastProject, writeLastProject } from './projectStore.js';
-import { createLogger } from './vendor/logger.js';
+import { addCredential, createLogger } from './vendor/logger.js';
 
 const logger = createLogger('QaConnection');
 
@@ -99,7 +99,9 @@ export class QaConnection {
   /** The config the adapter in `cached` was built from -- rebuild only when it actually changes. */
   private cachedFor: QaConfig | null = null;
 
-  constructor(private readonly startup: QaConfig) {
+  /** `rememberProject: false` on a shared server: never restore or persist the last project, because
+   *  that file is shared by every session on the pod. Each session then picks its project in chat. */
+  constructor(private readonly startup: QaConfig, private readonly rememberProject = true) {
     this.current = startup;
     this.source = startup.mode === 'connected' ? 'startup-config' : 'none';
     this.cached = null;
@@ -110,7 +112,7 @@ export class QaConnection {
     // async validate here): the id was validated when it was saved via switchProject/connect; if it
     // is since stale, project-scoped calls fail cleanly and the user can switch — the connection
     // itself is fine.
-    if (startup.mode === 'connected' && !startup.projectId) {
+    if (rememberProject && startup.mode === 'connected' && !startup.projectId) {
       // Key the remembered project by the effective backend base: `url` (agent /mcp) for the
       // legacy/SQA forwarder, else `baseUrl` (QA_BASE_URL) for the direct walnut path.
       const key = startup.url ?? startup.baseUrl ?? '';
@@ -167,6 +169,9 @@ export class QaConnection {
     const product: 'walnut' | 'simplifyqa' = req.product === 'simplifyqa' ? 'simplifyqa' : 'walnut';
 
     if (!token) return { ok: false, error: 'token is required.' };
+    // A caller's token (header or qa_connect) is scrubbed from every log line by exact value, like the
+    // startup token. ponytail: the redaction set only grows; fine for per-user keys at hosted scale.
+    addCredential(token);
     // A connection needs an endpoint. `baseUrl` (QA_BASE_URL) is the product BACKEND REST base for
     // direct data ops; `url` (QA_MCP_URL) is an MCP endpoint to hop to — the local agent (recording,
     // not-yet-ported writes). SimplifyQA specifically must have baseUrl (or a JWT embedding `url`)
@@ -235,7 +240,7 @@ export class QaConnection {
       this.source = 'runtime-connect';
       // Remember the project so a later restart reboots into it (see projectStore). Only when one
       // was actually chosen — a key-scoped connect may carry none.
-      if (candidate.projectId) writeLastProject(candidate.url ?? candidate.baseUrl ?? '', candidate.projectId);
+      if (this.rememberProject && candidate.projectId) writeLastProject(candidate.url ?? candidate.baseUrl ?? '', candidate.projectId);
       // URL and project only -- never the token, not even truncated.
       logger.info(`Connected to ${candidate.url ?? candidate.baseUrl} (project ${candidate.projectId || '(key-scoped)'}, auth ${auth})`);
       return { ok: true, info };
@@ -269,7 +274,7 @@ export class QaConnection {
       this.cachedFor = candidate;
       this.source = 'runtime-connect';
       // Remember it so a restart reboots into this project instead of project-less (projectStore).
-      writeLastProject(candidate.url ?? candidate.baseUrl ?? '', pid);
+      if (this.rememberProject) writeLastProject(candidate.url ?? candidate.baseUrl ?? '', pid);
       logger.info(`Switched to project ${pid}`);
       return { ok: true, info };
     } catch (err) {

@@ -1,4 +1,5 @@
 import type { TestCase, Step } from '../domain/types.js';
+import { CONDITION_KINDS, loopBlockProblems, normalizeLoopKinds, stepConditions } from '../adapters/simplifyqa/loopConditions.js';
 
 /**
  * Pre-run checks for DATABASE and API test cases, run at save time from the definition alone (nothing is executed).
@@ -48,6 +49,23 @@ export function lintAutomatedTestCase(tc: TestCase): string[] {
   let active: string | undefined = steps.map((x) => TECH[x.stepType]).find(Boolean);
   let switchUnknown = false;   // a function call may switch technology internally
 
+  // WHILE / DO-WHILE: matched blocks, a real condition, and no per-step maximum (checked on a copy as the save will write it)
+  try {
+    const loops = JSON.parse(JSON.stringify(steps)) as Step[];
+    normalizeLoopKinds(loops);
+    warnings.push(...loopBlockProblems(loops));
+    loops.forEach((s, i) => {
+      if (s.stepType !== 'control_flow') return;
+      const wire = String(s.sourceRaw?.['stepType'] ?? s.controlFlow?.kind ?? '').toUpperCase();
+      const stored = (s.sourceRaw?.['conditions'] as { children?: unknown[] } | undefined)?.children?.length;
+      if (CONDITION_KINDS.has(wire) && !stepConditions(s).length && !stored && !s.desktopConditions?.length) {
+        warnings.push(`step ${i + 1}: ${wire} has no condition — give controlFlow.condition (e.g. { type: "element_displayed", objectId }). A label (conditionText) alone is not a condition, and the run fails.`);
+      }
+      if (['WHILE_START', 'WHILE', 'DO'].includes(wire) && s.controlFlow?.maxIterations) {
+        warnings.push(`step ${i + 1}: SimplifyQA has no per-step maximum for a WHILE — maxIterations ${s.controlFlow.maxIterations} was not saved; the agent's own loop limit applies. To stop earlier, make the condition become false.`);
+      }
+    });
+  } catch { /* advisory only */ }
   steps.forEach((s, i) => {
     const at = `step ${s.n ?? i + 1}`;
     if (s.stepType === 'function') switchUnknown = true;

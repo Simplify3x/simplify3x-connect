@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
 import { zRawFilter } from './schemas.js';
+import type { TaskCreateInput, TaskCreateResult, TaskUpdateInput, TaskUpdateResult } from '../adapters/simplifyqa/adapter.js';
 
 export type TaskToolsDeps = {
   getAdapter: () => ProviderAdapter | null;
@@ -103,6 +104,110 @@ export function registerTaskTools(server: McpServer, deps: TaskToolsDeps): void 
             .map((t) => `| ${escCell(t.code ?? t.id)} | ${escCell(t.title)} | ${escCell(t.state ?? '-')} | ${escCell(t.priority ?? '-')} | ${escCell(displayAssigned(t.assignedTo))} |`)
             .join('\n');
         return ok(text, { tasks: rows, totalCount: totalOf(rows) ?? rows.length });
+      } catch (e) {
+        return err(describeError(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    'task_update',
+    {
+      title: 'Update a task (planned dates, assignee, state, …)',
+      description:
+        'Change an existing TASK — what the SimplifyQA editor does, then it READS THE TASK BACK and reports each change. Pass `taskId` ' +
+        '(id, code like TA-3, or exact name) and only what to change: `plannedStartDate` / `plannedEndDate` (YYYY-MM-DD), `assignee` ' +
+        '(email, name, user id or "me" — one that matches nobody is refused) or `unassign:true`, `state`, `priority` (the project\'s own ' +
+        'values; an unknown one is refused with the valid ones listed), `releaseId` / `sprintId` (id, code or name; a sprint brings its release; "none" clears), ' +
+        '`storyId` (the linked user story; "none" clears), `name`, `description`, `estimatedEffort`, `actualEffort`, `remainingEffort`. Needs the add_task ' +
+        'privilege. A start date after the end date is refused — move the end date too.',
+      inputSchema: {
+        taskId: z.string().describe('Task id, code (TA-3) or exact name.'),
+        plannedStartDate: z.string().optional().describe('YYYY-MM-DD.'),
+        plannedEndDate: z.string().optional().describe('YYYY-MM-DD.'),
+        assignee: z.string().optional().describe('Who to assign it to: email (rohini.k@simplify3x.com), name, numeric user id, or "me".'),
+        unassign: z.boolean().optional().describe('true = clear the assignee.'),
+        state: z.string().optional(),
+        priority: z.string().optional(),
+        name: z.string().optional().describe('New name (at least 3 characters).'),
+        description: z.string().optional(),
+        estimatedEffort: z.number().min(0).max(9999).optional(),
+        actualEffort: z.number().min(0).max(9999).optional(),
+        remainingEffort: z.number().min(0).max(9999).optional(),
+        releaseId: z.string().optional().describe('Release: id, code (RE-44) or exact name; "none" clears it (and the sprint).'),
+        sprintId: z.string().optional().describe('Sprint: id, code (SP-1) or exact name; it must belong to the task\'s release. "none" clears it.'),
+        storyId: z.string().optional().describe('Linked user story: id or key (US_123); "none" unlinks it.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async (args) => {
+      const adapter = deps.getAdapter() as (ProviderAdapter & { updateTask?: (ref: string, patch: TaskUpdateInput) => Promise<TaskUpdateResult> }) | null;
+      if (!adapter) return err('Not connected to a product. Use qa_connect({ url, token, projectId }) first — task_update needs a live backend connection.');
+      if (!adapter.updateTask) return err('This product does not expose task updates.');
+      const { taskId, ...rest } = args;
+      const patch: TaskUpdateInput = {};
+      for (const [k, v] of Object.entries(rest)) if (v !== undefined) (patch as Record<string, unknown>)[k] = v;
+      if (patch.unassign && patch.assignee !== undefined) return err('task_update: give either assignee or unassign:true, not both.');
+      if (!Object.keys(patch).length) {
+        return err('task_update needs something to change: plannedStartDate, plannedEndDate, assignee (or unassign), state, priority, releaseId, sprintId, storyId, name, description, estimatedEffort, actualEffort or remainingEffort.');
+      }
+      try {
+        const r = await adapter.updateTask(taskId, patch);
+        if (!r.written) return ok(`Task ${r.code} "${r.name}" already matches — nothing was changed.`, { ...r } as unknown as Record<string, unknown>);
+        return ok(
+          `Updated task ${r.code} "${r.name}" and read it back from SimplifyQA:\n` + r.changes.map((c) => `- ${c.field}: ${c.from} → ${c.to}`).join('\n'),
+          { ...r } as unknown as Record<string, unknown>,
+        );
+      } catch (e) {
+        return err(describeError(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    'task_create',
+    {
+      title: 'Create a task',
+      description:
+        'Create a TASK in the connected project — what Tasks → Create Task does — and return its key (TS-xx / TA-xx). Needs `name` and ' +
+        '`estimatedEffort` (hours); everything else is optional and DEFAULTED, and the answer lists what was defaulted: type / state / priority = ' +
+        'the project\'s own default values, planned dates = the sprint\'s (else the release\'s, else today). Optional: `description`, `assignee` ' +
+        '(email, name, user id or "me" — one that matches nobody is refused), `releaseId` / `sprintId` (id, code or exact name; a sprint brings ' +
+        'its release and must belong to the release named), `storyId` (the user story it belongs to: id or key), `type`, `state`, `priority`, ' +
+        '`plannedStartDate` / `plannedEndDate` (YYYY-MM-DD). A task with the same name in the project is refused. Reads the task back. ' +
+        'Needs the add_task privilege. Change it later with task_update.',
+      inputSchema: {
+        name: z.string().describe('Task name (2–500 characters).'),
+        estimatedEffort: z.number().min(0).max(9999).describe('Estimate in hours.'),
+        description: z.string().optional(),
+        assignee: z.string().optional().describe('Email, name, numeric user id or "me". Default: unassigned.'),
+        releaseId: z.string().optional().describe('Release: id, code (RE-44) or exact name.'),
+        sprintId: z.string().optional().describe('Sprint: id, code (SP-1) or exact name; it must belong to the release.'),
+        storyId: z.string().optional().describe('User story it belongs to: id or key (US_123).'),
+        type: z.string().optional().describe('Task type — one of the project\'s own; default: the project\'s default type.'),
+        state: z.string().optional(),
+        priority: z.string().optional(),
+        plannedStartDate: z.string().optional().describe('YYYY-MM-DD.'),
+        plannedEndDate: z.string().optional().describe('YYYY-MM-DD.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async (args) => {
+      const adapter = deps.getAdapter() as (ProviderAdapter & { createTask?: (input: TaskCreateInput) => Promise<TaskCreateResult> }) | null;
+      if (!adapter) return err('Not connected to a product. Use qa_connect({ url, token, projectId }) first — task_create needs a live backend connection.');
+      if (!adapter.createTask) return err('This product does not expose task creation.');
+      try {
+        const input: TaskCreateInput = { name: args.name, estimatedEffort: args.estimatedEffort };
+        for (const [k, v] of Object.entries(args)) if (k !== 'name' && k !== 'estimatedEffort' && v !== undefined) (input as Record<string, unknown>)[k] = v;
+        const r = await adapter.createTask(input);
+        const where = [r.release ? `release ${r.release}` : '', r.sprint ? `sprint ${r.sprint}` : ''].filter(Boolean).join(', ');
+        const text = [
+          `Created task ${r.code} "${r.name}" — ${r.type || 'task'}, state ${r.state || '-'}, priority ${r.priority || '-'}, ${r.plannedStartDate} → ${r.plannedEndDate}, ` +
+            `estimate ${r.estimatedEffort} h${where ? `, ${where}` : ''}${r.ownerIds.length ? `, assigned to ${args.assignee}` : ', unassigned'}. Read back from SimplifyQA.`,
+          ...(r.defaults.length ? [`Defaulted (not given): ${r.defaults.join('; ')}.`] : []),
+          ...r.warnings.map((w) => `⚠️ ${w}`),
+        ].join('\n');
+        return ok(text, { ...r } as unknown as Record<string, unknown>);
       } catch (e) {
         return err(describeError(e));
       }

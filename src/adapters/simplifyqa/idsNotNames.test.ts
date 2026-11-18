@@ -6,7 +6,7 @@ const fnStep = (over: Record<string, unknown> = {}) => fromSqaStep({
 }, 1);
 const save = (steps: any[]) => (buildTestcasePayload({
   projectId: 19, moduleId: 7, existingId: '42',
-  tc: { id: 'TC_42', title: 't', priority: 'medium', category: 'automated', steps } as any,
+  tc: { id: 'TC_42', title: 't', priority: 'medium', category: 'automated', technologyType: 'WEB', steps } as any,
   paramIdByName: new Map(), stepResolutions: steps.map(() => ({ actionId: null, objectId: null })),
 } as any) as any).steps.automationSteps[0];
 

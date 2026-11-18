@@ -91,7 +91,20 @@ function scheduleLine(s: ScheduleInfo): string {
 const SCHEDULE_TYPE_DESC =
   "SCHEDULE STEP — REQUIRED for when:'schedule'; ASK the user explicitly, never assume. The " +
   "UI's Recurrence choices: 'once', 'every_5_minutes', 'hourly', 'daily', 'weekly', 'monthly'. " +
-  "Anything but 'once' also needs endDate. ('weekdays' = weekly Mon–Fri, MCP shortcut — don't offer it.)";
+  "Anything but 'once' also needs endDate. ('weekdays' = weekly Mon–Fri, MCP shortcut — don't offer it.) " +
+  "REPEAT EVERY N: hourly / daily / weekly / monthly take `interval` N (hourly + interval 2 = every 2 hours; default 1); weekly takes `daysOfWeek`; " +
+  "monthly takes `dayOfMonth` (1–30) OR `occurrence` (first/second/third/last) + one weekday in `daysOfWeek`. SimplifyQA has NO 'every N minutes' — " +
+  "only every_5_minutes (fixed).";
+/** "every 2 hours" / "weekly on MONDAY, FRIDAY" / "monthly on the first MONDAY" — what a schedule repeats as, in words. */
+export function describeCadence(type: string | undefined, o: { interval?: number | undefined; daysOfWeek?: string[] | undefined; dayOfMonth?: number | undefined; occurrence?: string | undefined }): string {
+  const t = type ?? 'once';
+  const unit: Record<string, string> = { hourly: 'hour', daily: 'day', weekly: 'week', monthly: 'month' };
+  const every = unit[t] ? (o.interval && o.interval > 1 ? `every ${o.interval} ${unit[t]}s` : `${t}`) : t;
+  const days = o.daysOfWeek?.length ? ` on ${o.daysOfWeek.map((d) => d.toUpperCase()).join(', ')}` : '';
+  if (t === 'monthly' && o.occurrence) return `${every} on the ${o.occurrence} ${(o.daysOfWeek?.[0] ?? '').toUpperCase()}`.trim();
+  if (t === 'monthly' && o.dayOfMonth) return `${every} on day ${o.dayOfMonth}`;
+  return `${every}${t === 'weekly' ? days : ''}`;
+}
 const END_DATE_DESC = "SCHEDULE STEP — ISO end date; REQUIRED when scheduleType is anything but 'once'. ASK the user.";
 
 /** The scheduler form's Recurrence dropdown, in the UI's order — what the user is asked to pick from. */
@@ -518,10 +531,15 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
         scheduleType: z.enum(SCHEDULE_TYPES).optional().describe(SCHEDULE_TYPE_DESC),
         endDate: z.string().optional().describe(END_DATE_DESC),
         timezone: z.string().optional().describe("IANA timezone for a schedule (e.g. 'Asia/Kolkata'). Default 'UTC'."),
+        scheduleName: z.string().min(3).max(501).optional().describe("when:'schedule' — the schedule's NAME as the Scheduler shows it (3–501 characters, unique in the project), e.g. 'nightly smoke'. Omit it and the schedule is named '<TC-22> schedule' (numbered when taken)."),
+        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1. Not for 'once' / 'every_5_minutes' (fixed at 5 minutes — SimplifyQA has no other minute interval)."),
+        daysOfWeek: z.array(z.string()).optional().describe("Weekly: the weekdays to run on (MONDAY … SUNDAY or MON … SUN); default = the start's weekday. Monthly with `occurrence`: the one weekday."),
+        dayOfMonth: z.number().int().min(1).max(30).optional().describe("Monthly 'ON DAY': 1–30; default = the start's day."),
+        occurrence: z.enum(['first', 'second', 'third', 'last']).optional().describe("Monthly 'ON THE': the first / second / third / last weekday of the month — give the weekday in daysOfWeek."),
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ tcId, reuseConfig, when, mode, agentId, environment, browser, headless, cloudRunnerId, deviceId, deviceName: deviceNameArg, deviceType, cloudDeviceType, osVersion, devices, scheduledFor, scheduleType, endDate, timezone, releaseId, sprintId, versionId }) => {
+    async ({ tcId, reuseConfig, when, mode, agentId, environment, browser, headless, cloudRunnerId, deviceId, deviceName: deviceNameArg, deviceType, cloudDeviceType, osVersion, devices, scheduledFor, scheduleType, endDate, timezone, scheduleName, interval, daysOfWeek, dayOfMonth, occurrence, releaseId, sprintId, versionId }) => {
       let deviceName = deviceNameArg;
       const adapter = deps.getAdapter();
       if (!adapter) return err(NOT_CONNECTED);
@@ -769,6 +787,11 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
           ...(scheduleType !== undefined ? { scheduleType } : {}),
           ...(endDate !== undefined ? { endDate } : {}),
           ...(timezone !== undefined ? { timezone } : {}),
+          ...(scheduleName !== undefined ? { name: scheduleName } : {}),
+          ...(interval !== undefined ? { interval } : {}),
+          ...(daysOfWeek !== undefined ? { daysOfWeek } : {}),
+          ...(dayOfMonth !== undefined ? { dayOfMonth } : {}),
+          ...(occurrence !== undefined ? { occurrence } : {}),
         };
         try {
           const sched = await adapter.createSchedule({ tcId }, schedOpts);
@@ -778,7 +801,7 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
             : `agent \`${agentId}\``;
           if (projectId) lastRun.set(projectId, { when, mode, releaseId, sprintId, browser, agentId, cloudRunnerId });
           return ok(
-            `Scheduled ${tcId} (${scheduleType ?? 'once'}, ${mode}) for ${scheduledFor}${next} → ${where}. Schedule id \`${sched.id}\`.`,
+            `Scheduled ${tcId} (${describeCadence(scheduleType, { interval, daysOfWeek, dayOfMonth, occurrence })}, ${mode}) for ${scheduledFor}${next} → ${where}. Schedule id \`${sched.id}\`${sched.name ? ` named "${sched.name}"` : ''}.`,
             { schedule: sched, mode, when: 'schedule', ...(pinnedRunner ? { runner: pinnedRunner } : {}) },
           );
         } catch (e) {
@@ -903,10 +926,15 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
         scheduleType: z.enum(SCHEDULE_TYPES).optional().describe(SCHEDULE_TYPE_DESC),
         endDate: z.string().optional().describe(END_DATE_DESC),
         timezone: z.string().optional().describe("IANA timezone for a schedule (e.g. 'Asia/Kolkata'). Default 'UTC'."),
+        scheduleName: z.string().min(3).max(501).optional().describe("when:'schedule' — the schedule's NAME as the Scheduler shows it (3–501 characters, unique in the project), e.g. 'nightly smoke'. Omit it and the schedule is named '<TC-22> schedule' (numbered when taken)."),
+        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1. Not for 'once' / 'every_5_minutes' (fixed at 5 minutes — SimplifyQA has no other minute interval)."),
+        daysOfWeek: z.array(z.string()).optional().describe("Weekly: the weekdays to run on (MONDAY … SUNDAY or MON … SUN); default = the start's weekday. Monthly with `occurrence`: the one weekday."),
+        dayOfMonth: z.number().int().min(1).max(30).optional().describe("Monthly 'ON DAY': 1–30; default = the start's day."),
+        occurrence: z.enum(['first', 'second', 'third', 'last']).optional().describe("Monthly 'ON THE': the first / second / third / last weekday of the month — give the weekday in daysOfWeek."),
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ suiteId, reuseConfig, releaseId, sprintId, mode, agentId, environment, browser, headless, cloudRunnerId, strategy, maxConcurrent, terminateOnFailure, when, scheduledFor, scheduleType, endDate, timezone }) => {
+    async ({ suiteId, reuseConfig, releaseId, sprintId, mode, agentId, environment, browser, headless, cloudRunnerId, strategy, maxConcurrent, terminateOnFailure, when, scheduledFor, scheduleType, endDate, timezone, scheduleName, interval, daysOfWeek, dayOfMonth, occurrence }) => {
       const adapter = deps.getAdapter();
       if (!adapter) return err(NOT_CONNECTED);
 
@@ -1050,6 +1078,11 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
           ...(scheduleType !== undefined ? { scheduleType } : {}),
           ...(endDate !== undefined ? { endDate } : {}),
           ...(timezone !== undefined ? { timezone } : {}),
+          ...(scheduleName !== undefined ? { name: scheduleName } : {}),
+          ...(interval !== undefined ? { interval } : {}),
+          ...(daysOfWeek !== undefined ? { daysOfWeek } : {}),
+          ...(dayOfMonth !== undefined ? { dayOfMonth } : {}),
+          ...(occurrence !== undefined ? { occurrence } : {}),
         };
         try {
           const sched = await adapter.createSchedule({ suiteId }, schedOpts);
@@ -1059,7 +1092,7 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
             : `agent \`${agentId}\``;
           if (projectId) lastRun.set(projectId, { when, mode, releaseId, sprintId, browser, agentId, cloudRunnerId });
           return ok(
-            `Scheduled suite ${suiteId} (${scheduleType ?? 'once'}, ${mode}) for ${scheduledFor}${next} → ${where}. Schedule id \`${sched.id}\`.`,
+            `Scheduled suite ${suiteId} (${describeCadence(scheduleType, { interval, daysOfWeek, dayOfMonth, occurrence })}, ${mode}) for ${scheduledFor}${next} → ${where}. Schedule id \`${sched.id}\`${sched.name ? ` named "${sched.name}"` : ''}.`,
             { schedule: sched, mode, when: 'schedule', ...(pinnedRunner ? { runner: pinnedRunner } : {}) },
           );
         } catch (e) {
@@ -1307,14 +1340,24 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
     {
       title: 'Edit a schedule',
       description:
-        "Change a schedule's time / recurrence / end date / timezone / browser / environment, or RE-PIN its " +
+        "Change a schedule's NAME / WHAT IT RUNS (a test case or a suite — `testCaseId` or `suiteId`; the schedule switches between Test Case and Suite as the Scheduler form does, keeping the same id) / " +
+        "time / recurrence / end date / timezone / browser / environment / release / sprint, or RE-PIN its " +
         'agent. Pass `scheduleId` (from schedule_list) and ONLY the fields to change. To re-pin: ' +
         "mode:'local' + `agentId` (from local_agents), or mode:'cloud' + a runner's `cloudRunnerCredentialId` " +
         '(the `credentialId` from cloud_runners). Requires a live connection.',
       inputSchema: {
         scheduleId: z.string().describe('The schedule id (from schedule_list).'),
+        name: z.string().min(3).max(501).optional().describe('Rename the schedule (3–501 characters, unique in the project) — the name the Scheduler shows.'),
+        testCaseId: z.string().optional().describe('Make it run THIS test case (id or code, e.g. TC-35) — a suite schedule becomes a Test Case schedule. Not together with suiteId.'),
+        suiteId: z.string().optional().describe('Make it run THIS suite (id or code, e.g. SU-4) — a test-case schedule becomes a Suite schedule (which needs a release). Not together with testCaseId.'),
+        releaseId: z.string().optional().describe('Release: id, code (RE-44) or exact name; "none" clears it. A suite schedule needs one.'),
+        sprintId: z.string().optional().describe('Sprint: id, code (SP-1) or exact name; it must belong to the release. "none" clears it.'),
         scheduledFor: z.string().optional().describe('New start / next-run ISO datetime.'),
         scheduleType: z.enum(SCHEDULE_TYPES).optional().describe('New recurrence (same choices as the UI: once, every_5_minutes, hourly, daily, weekly, monthly). Anything but once needs an endDate.'),
+        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1; giving it alone changes the schedule's current cadence. Not for 'once' / 'every_5_minutes' (fixed at 5 minutes — SimplifyQA has no other minute interval)."),
+        daysOfWeek: z.array(z.string()).optional().describe("Weekly: the weekdays to run on (MONDAY … SUNDAY or MON … SUN); default = the start's weekday. Monthly with `occurrence`: the one weekday."),
+        dayOfMonth: z.number().int().min(1).max(30).optional().describe("Monthly 'ON DAY': 1–30; default = the start's day."),
+        occurrence: z.enum(['first', 'second', 'third', 'last']).optional().describe("Monthly 'ON THE': the first / second / third / last weekday of the month — give the weekday in daysOfWeek."),
         endDate: z.string().optional().describe('New ISO end date (for recurring schedules).'),
         timezone: z.string().optional().describe("New IANA timezone (e.g. 'Asia/Kolkata')."),
         browser: z.enum(['chromium', 'msedge', 'firefox', 'webkit']).optional().describe('New browser (schedules accept chromium/msedge/firefox/webkit, not chrome).'),
@@ -1325,13 +1368,22 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ scheduleId, scheduledFor, scheduleType, endDate, timezone, browser, environment, mode, agentId, cloudRunnerCredentialId }) => {
+    async ({ scheduleId, name, testCaseId, suiteId, releaseId, sprintId, scheduledFor, scheduleType, interval, daysOfWeek, dayOfMonth, occurrence, endDate, timezone, browser, environment, mode, agentId, cloudRunnerCredentialId }) => {
       const adapter = deps.getAdapter();
       if (!adapter) return err(NOT_CONNECTED);
       if (!adapter.updateSchedule) return err('This product does not support editing schedules.');
       const changes: ScheduleUpdate = {
+        ...(name !== undefined ? { name } : {}),
+        ...(testCaseId !== undefined ? { tcId: testCaseId } : {}),
+        ...(suiteId !== undefined ? { suiteId } : {}),
+        ...(releaseId !== undefined ? { releaseId } : {}),
+        ...(sprintId !== undefined ? { sprintId } : {}),
         ...(scheduledFor !== undefined ? { scheduledFor } : {}),
         ...(scheduleType !== undefined ? { scheduleType } : {}),
+        ...(interval !== undefined ? { interval } : {}),
+        ...(daysOfWeek !== undefined ? { daysOfWeek } : {}),
+        ...(dayOfMonth !== undefined ? { dayOfMonth } : {}),
+        ...(occurrence !== undefined ? { occurrence } : {}),
         ...(endDate !== undefined ? { endDate } : {}),
         ...(timezone !== undefined ? { timezone } : {}),
         ...(browser !== undefined ? { browser } : {}),
@@ -1341,11 +1393,15 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
         ...(cloudRunnerCredentialId !== undefined ? { cloudRunnerCredentialId } : {}),
       };
       if (Object.keys(changes).length === 0) {
-        return err('Nothing to change — pass at least one field to edit (e.g. scheduledFor, scheduleType, browser, or a re-pin via mode + agentId/cloudRunnerCredentialId).');
+        return err('Nothing to change — pass at least one field to edit (e.g. name, testCaseId / suiteId, scheduledFor, interval / daysOfWeek, scheduleType, browser, or a re-pin via mode + agentId/cloudRunnerCredentialId).');
       }
       try {
         const ref = await adapter.updateSchedule(scheduleId, changes);
-        return ok(`Updated schedule \`${ref.id}\`${ref.nextRunAt ? ` · next run ${ref.nextRunAt}` : ''}.`, { schedule: ref });
+        return ok(
+          `Updated schedule \`${ref.id}\`${ref.name ? ` — name now "${ref.name}" (read back)` : ''}${testCaseId || suiteId ? ` — now runs ${testCaseId ?? suiteId} (read back)` : ''}${ref.nextRunAt ? ` · next run ${ref.nextRunAt}` : ''}.` +
+            (ref.notes?.length ? '\n' + ref.notes.map((n) => `ℹ️ ${n}`).join('\n') : ''),
+          { schedule: ref },
+        );
       } catch (e) {
         return err(describeError(e));
       }

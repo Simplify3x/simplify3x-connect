@@ -9,7 +9,8 @@ import { zJournalOp, zRawFilter } from './schemas.js';
 import { stepsMarkdown } from './markdown.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { buildXlsx } from './xlsx.js';
+import { resolveOutDir } from './outDir.js';
+import { buildXlsx } from '../export/xlsx.js';
 
 /**
  * The read side of the shared, product-neutral lifecycle contract: `tc_list` and
@@ -26,6 +27,8 @@ export type DiscoveryToolsDeps = {
    *  (`fromDraftId`) instead of cloning what is already stored. Absent when the draft store isn't
    *  available in this build; the snapshot path stays fully functional. */
   getDraft?: (draftId: string) => { tc: TestCase } | null;
+  /** False on a server other machines can reach: a caller `outDir` is then ignored (tools/outDir.ts). Default true. */
+  allowOutDir?: boolean;
 };
 
 const NOT_CONNECTED =
@@ -285,7 +288,7 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
             ...(hasSteps ? [r.stepCount ?? ''] : []),
             r.obsolete === true ? 'yes' : '',
           ]);
-          const dir = outDir ?? join(process.cwd(), 'qa-reports');
+          const { dir, note: outDirNote } = resolveOutDir(outDir, deps.allowOutDir !== false);
           await mkdir(dir, { recursive: true });
           const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
           const file = join(dir, `test-cases_${stamp}.xlsx`);
@@ -293,7 +296,8 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
           return ok(
             `Exported **${all.length}** test case${all.length === 1 ? '' : 's'} to \`${file}\`.\n` +
               `Columns: ${headers.join(', ')}.\nFilters applied: ${appliedFilters}.\n` +
-              'The list carries no parameter values, so nothing protected is included.',
+              'The list carries no parameter values, so nothing protected is included.' +
+              (outDirNote ? `\n${outDirNote}` : ''),
             { file, count: all.length, filters: appliedFilters },
           );
         }
@@ -1316,6 +1320,7 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
         'on child nodes). Duplicate name in the same project is rejected server-side. On mid-subtree ' +
         'failure the response carries `failedAt`; every node before it is already persisted (no ' +
         'transactional rollback upstream). SimplifyQA-only. Requires a live connection.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         name: z.string().min(1).describe('Module name. Must be unique within the project.'),
         projectId: z.string().describe('Target project id (see list_projects).'),
@@ -1364,6 +1369,7 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
         'it to rename or move it. `parentId` moves the module elsewhere in the tree (pass `""` to move ' +
         'it to project root); moving it under itself or under one of its own descendants is refused. ' +
         'SimplifyQA-only. Requires a live connection.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         id: z.string().describe('Module id (numeric or business key, e.g. MO_12).'),
         name: z.string().min(1).optional().describe('New module name.'),
@@ -1945,6 +1951,7 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
         '  • update_step patch.api is MERGED into the saved API request (add an assertion: api.addAssertions [{ path, condition, expectedValue }]; api.assertions replaces the list) — edit an API step with this, never remove_step + add_step\n' +
         '  • wrap_in_loop { from, to, condition?, maxIterations? } — wrap steps from..to in a while loop\n' +
         '  • wrap_in_if   { from, to, condition? } — wrap steps from..to in an if block\n' +
+        '  • add_step with stepType "control_flow" and controlFlow { kind, condition } — kind "while" … "end_while" (WHILE), "do" … "end_do_while" (DO-WHILE; the condition goes on the closing step). Conditions: controlFlow.condition = { type: element_displayed | element_not_displayed | element_enabled | element_disabled | element_clickable | element_checked, objectId | objectName }, or controlFlow.conditions [...] joined by each one\'s logical AND|OR.\n' +
         '  • insert_nested { at?, tcId, name? } — insert an existing test case as a nested step (reuse)\n' +
         'For a test case backed by a recording journal the journal is kept in sync (so healer / ' +
         're-record stay consistent); others edit the persisted steps. NOTE: adding a brand-new ' +

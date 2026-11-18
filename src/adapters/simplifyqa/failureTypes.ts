@@ -50,11 +50,19 @@ export type FailureStep = {
   errorLines: string[];
   /** All execution logs, capped by maxLogLines. */
   logs: string[];
+  /** A failed step's last REVIEW_LOG_LINES cleaned log lines, kept for every iteration (the review
+   *  reads every failed test case; `logs` is cleared on non-representatives). */
+  logTail?: string[];
   logCount: number;
   screenshots: FailureArtifact[];
+  /** The step's baseline image: copiedBaseLinepath (the run's copy, as the report shows it), else
+   *  recordedBaseLinePath. Absolute on the SQA host (failureImages.normaliseImageUrl); a value that
+   *  is not an image or not on the host is left out and noted in `imageNotes`. */
   recordedBaseline?: string;
+  /** The element thumbnail (recording time): recordedThumbnailPath, else copiedThumbnailpath, else the old executed* fallbacks. */
   recordedThumbnail?: string;
-  executedThumbnail?: string;
+  /** "baseline skipped: \"undefined.png\" is not an image" — one per image slot with no usable value. */
+  imageNotes?: string[];
   testdata?: Array<Record<string, unknown>>;
   networkLogs?: unknown;
   apiData?: unknown;
@@ -77,6 +85,10 @@ export type ExecutionFailureInput = {
   includeLogs?: boolean;
   maxLogLines?: number;
   includeScreenshots?: boolean;
+  /** Failed iterations to analyse at most (default MAX_FAILURE_RUNS) — a multi-execution analysis's remaining budget. */
+  maxFailedRuns?: number;
+  /** Cause groups whose representative keeps full logs (default MAX_DETAILED_GROUPS). */
+  detailedGroups?: number;
 };
 
 export type FailureIteration = {
@@ -85,6 +97,8 @@ export type FailureIteration = {
   label: string;
   testcaseCode?: string;
   testcaseName?: string;
+  /** The test case's description, markup stripped and capped. */
+  testcaseDescription?: string;
   versionName?: string;
   /** This iteration's failure category (its focus step's, else the run exception's). */
   category?: string;
@@ -110,6 +124,9 @@ export type FailureIteration = {
   flow?: FailureFlow;
   /** Set when this iteration's steps could not be read. */
   readError?: string;
+  /** Every protected test data value (>= 3 chars) of this run's step rows. Its text fields are
+   *  already masked with these at read time; kept as the second net for model-written text. */
+  protectedValues?: string[];
 };
 
 /** What a tester reads before judging a failure: the run's flow, what it never reached, how this
@@ -128,6 +145,8 @@ export type FailureTestcaseEntry = {
   executionItemId: string;
   code?: string;
   name?: string;
+  /** Description, markup stripped and capped. */
+  description?: string;
   versionId?: string;
   versionName?: string;
   stepId?: string;
@@ -161,6 +180,8 @@ export type ExecutionFailureContext = {
     status: string;
     executionTypeCode?: string;
     executionTypeName?: string;
+    /** The parent (suite / plan / test case) number — the history key. */
+    executionTypeId?: string;
     /** The execution's environment (`environmentType`). */
     environment?: string;
     childExecution?: boolean;

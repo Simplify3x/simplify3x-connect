@@ -32,3 +32,6 @@ coverage/
 # Internal working docs + eval harness: kept local, not shipped
 /MCP-OPTIMISATION.md
 /eval/
+
+# Generated failure-analysis exports (contain project data)
+qa-reports/

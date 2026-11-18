@@ -102,8 +102,10 @@ export type SqaCollection = {
   maxLimit?: number;
   totalCountReliable?: boolean;
   /** Boolean fields whose `true` rows the product hides unless a filter names the field (the UI
-   *  hides obsolete test cases: 532 shown of 535 stored). Applied with value resolution on. */
-  hiddenUnlessAsked?: string[];
+   *  hides obsolete test cases: 532 shown of 535 stored). Applied with value resolution on.
+   *  The object form also stops hiding when a filter names any of `askedBy` (e.g. naming
+   *  `parentExecutionId` asks for child runs; naming `id`/`code` looks one row up, whatever it is). */
+  hiddenUnlessAsked?: Array<string | { field: string; askedBy: string[] }>;
   /** Each version is its own document under the same `id` — one entity, several rows. Rows are
    *  collapsed to one per id with value resolution on (prefer `parent:true`, then newest). */
   versioned?: boolean;
@@ -215,7 +217,10 @@ export const SQA_COLLECTIONS: Record<string, SqaCollection> = {
       updatedBy: ['number', EQ],
       obsolete: ['boolean', BOOL],
       reviewApproveStatus: ['string', STR],
-      isHybrid: ['boolean', BOOL],
+      // NOTE: there is NO hybrid column. The backend rejects `isHybrid` on both the test case and its
+      // version ("tcfnObj.isHybrid is not allowed", HTTP 400), and searching it returns 0 rows either
+      // way. A hybrid test case is only detectable from its steps (SWITCH_TO_* + each step's
+      // technologyType); do NOT advertise it as a filterable field.
       updateVersion: ['number', NUM],
       tags: ['array', ARR],
       suiteId: ['array', ARR],
@@ -1608,7 +1613,11 @@ export const SQA_COLLECTIONS: Record<string, SqaCollection> = {
   executions: {
     name: 'executions',
     aliases: ['execution', 'run', 'runs'],
-    description: 'Run headers for suites/test cases, with status/result and embedded execution items.',
+    description: 'Run headers for suites/test cases/execution plans, with status/result and embedded execution items. '
+      + 'Lists PARENT runs only, as Reports v2 does: an EP\'s suite runs and cloud stack chunks (childExecution:true) and '
+      + 're-execution snapshots (parentExecutionCopy:true) are hidden unless a filter names childExecution / '
+      + 'parentExecutionId / parentExecutionCopy, the lookup is by id/code, or includeHidden is set. '
+      + 'Use relation "children" for a parent\'s child runs.',
     usedFor: 'Find the latest run, inspect status/results, and follow a run to its step results.',
     searchPath: '/exec/execution/search',
     scope: 'project',
@@ -1617,6 +1626,12 @@ export const SQA_COLLECTIONS: Record<string, SqaCollection> = {
     keyField: 'code',
     labelField: 'code',
     defaultSelect: ['id', 'code', 'type', 'executionTypeId', 'status', 'result', 'executionCategory', 'mode', 'environmentType', 'iterationId', 'releaseId', 'childExecution', 'parentExecutionId', 'startTime', 'endTime'],
+    // Same rows as the Reports v2 list (reports.controller getReports, current-executions-v2):
+    // `$nor {childExecution:true}` and `$nor {parentExecutionCopy:true}` keep false AND missing.
+    hiddenUnlessAsked: [
+      { field: 'childExecution', askedBy: ['parentExecutionId', 'id', 'code'] },
+      { field: 'parentExecutionCopy', askedBy: ['oldId', 'id', 'code'] },
+    ],
     fields: fields({
       id: ['number', NUM],
       code: ['string', STR],
@@ -1633,6 +1648,8 @@ export const SQA_COLLECTIONS: Record<string, SqaCollection> = {
       agentId: ['number', EQ],
       childExecution: ['boolean', BOOL],
       parentExecutionId: ['number', EQ],
+      parentExecutionCopy: ['boolean', BOOL, { label: 'Re-execution snapshot of a parent run' }],
+      oldId: ['number', EQ, { label: 'Original run id (on a parentExecutionCopy row)' }],
       executionType: ['string', STR],
       startTime: ['date', DATE],
       endTime: ['date', DATE],
@@ -1646,6 +1663,10 @@ export const SQA_COLLECTIONS: Record<string, SqaCollection> = {
         kind: 'subresource', localField: 'id',
         subresourcePath: '/reports/execution/getstepResult',
         description: 'Per-step results for this run (executionId/executionRunId/parentId).',
+      },
+      children: {
+        kind: 'query', to: 'executions', localField: 'id', remoteField: 'parentExecutionId',
+        description: 'Child runs of a parent run: an execution plan\'s suite runs, cloud stack chunks.',
       },
     },
   },

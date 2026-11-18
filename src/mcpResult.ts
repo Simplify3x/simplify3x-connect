@@ -7,17 +7,19 @@ export const err = (text: string) => ({ isError: true as const, content: [{ type
 export const ok = (text: string, structuredContent?: Record<string, unknown>) =>
   ({ content: [{ type: 'text' as const, text }], ...(structuredContent ? { structuredContent } : {}) });
 
-/** `ok` plus inline images, each preceded by its caption so the reader knows what it shows. */
+/** `ok` plus inline images, each preceded by its caption so the reader knows what it shows. An entry
+ *  without `data` is its caption only (a text note in place of a missing image). */
 export const okWithImages = (
   text: string,
-  images: Array<{ caption: string; data: string; mimeType: string }>,
+  images: Array<{ caption: string; data?: string; mimeType?: string }>,
   structuredContent?: Record<string, unknown>,
 ) => ({
   content: [
     { type: 'text' as const, text },
     ...images.flatMap((img) => [
       { type: 'text' as const, text: img.caption },
-      { type: 'image' as const, data: img.data, mimeType: img.mimeType },
+      ...(img.data !== undefined && img.mimeType !== undefined
+        ? [{ type: 'image' as const, data: img.data, mimeType: img.mimeType }] : []),
     ]),
   ],
   ...(structuredContent ? { structuredContent } : {}),

@@ -614,6 +614,7 @@ export function registerTestdataTools(server: McpServer, deps: TestdataToolsDeps
         'the source row (default: the suite default row, normally ITR-1); `name` names the new row ' +
         '(default: the next free ITR-N). The tool then reads the suite\'s test data back and confirms the ' +
         'new row exists. Refuses a duplicate row name.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         suiteId: z.string().describe('Suite id or business key (SU-24).'),
         environmentType: z.string().describe('Environment key from tc_list_environments (e.g. general, general_1).'),
@@ -651,8 +652,9 @@ export function registerTestdataTools(server: McpServer, deps: TestdataToolsDeps
       description:
         'Delete one or more test-data iteration rows by NAME (e.g. "ITR-2") or id. Works at TEST CASE level ' +
         '(`entityType:"TC"` + `tcId`) and at SUITE level (`entityType:"SU"` + `suiteId`). The DEFAULT row is ' +
-        'refused. Use this to remove rows created by mistake. It reads the rows back after deleting and ' +
+        'refused — to replace the default, first make another row the default with testdata_set_default_iteration. Use this to remove rows created by mistake. It reads the rows back after deleting and ' +
         'reports what remains.',
+      annotations: { readOnlyHint: false, destructiveHint: true },
       inputSchema: {
         entityType: z.enum(['TC', 'SU']).optional().describe('TC = a test case\'s own test data; SU = suite-level test data. Default TC.'),
         tcId: z.string().optional().describe('Test case id / TC-123 (required when entityType is TC).'),
@@ -679,6 +681,49 @@ export function registerTestdataTools(server: McpServer, deps: TestdataToolsDeps
         );
       } catch (e) {
         return err(`Could not delete test-data row(s): ${describeError(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    'testdata_set_default_iteration',
+    {
+      title: 'Make a test-data iteration the default (test case or suite level)',
+      description:
+        'Make one iteration row the DEFAULT of an environment — the row a run uses — e.g. "make ITR-2 the default for SU-23 in General". Works at TEST CASE ' +
+        'level (`entityType:"TC"` + `tcId`) and SUITE level (`entityType:"SU"` + `suiteId`). Pass the iteration by NAME (e.g. "ITR-2") or id. The previous ' +
+        'default simply stops being the default (it is NOT deleted — delete it afterwards with testdata_delete_iterations if wanted); other environments\' ' +
+        'defaults are kept. It reads the test data back and reports the new default; asking for the row that already is the default changes nothing.',
+      inputSchema: {
+        entityType: z.enum(['TC', 'SU']).optional().describe('TC = a test case\'s own test data; SU = suite-level test data. Default TC.'),
+        tcId: z.string().optional().describe('Test case id / TC-123 (required when entityType is TC).'),
+        suiteId: z.string().optional().describe('Suite id / SU-23 (required when entityType is SU).'),
+        environmentType: z.string().describe('Environment key from tc_list_environments (e.g. general, general_1) — each environment has its own default.'),
+        iteration: z.string().min(1).describe('The iteration to make the default: its name (e.g. "ITR-2") or id.'),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ entityType, tcId, suiteId, environmentType, iteration }) => {
+      const adapter = deps.getAdapter?.() as (ProviderAdapter & {
+        setDefaultTestdataIteration?: (q: { entityType: 'TC' | 'FN' | 'SU'; id: string; environmentType: string; iteration: string }) =>
+          Promise<{ iteration: string; previous?: string; changed: boolean; rows: TestdataRows }>;
+      }) | null | undefined;
+      if (!adapter) return err('Not connected to a product. Use qa_connect first.');
+      if (!adapter.setDefaultTestdataIteration) return err('Changing the default test-data row is not supported by the connected provider.');
+      const type = entityType ?? (suiteId ? 'SU' : 'TC');
+      const id = type === 'SU' ? suiteId : tcId;
+      if (!id) return err(type === 'SU' ? 'Pass suiteId for entityType "SU".' : 'Pass tcId for entityType "TC".');
+      const envErr = await rejectUnlistedEnv(adapter, environmentType);
+      if (envErr) return err(envErr);
+      try {
+        const res = await adapter.setDefaultTestdataIteration({ entityType: type, id, environmentType, iteration });
+        const where = `${type === 'SU' ? 'suite' : 'test case'} ${id} — env ${environmentType}`;
+        const head = res.changed
+          ? `${res.iteration} is now the default iteration of ${where}${res.previous ? ` (it was ${res.previous}, which still exists but is no longer the default)` : ''}. Read back from SimplifyQA.`
+          : `${res.iteration} is already the default iteration of ${where} — nothing was changed.`;
+        return ok(`${head}\n\nRows now:\n\n` + summarizeTestdata(res.rows), { iteration: res.iteration, previous: res.previous, changed: res.changed, rows: res.rows } as unknown as Record<string, unknown>);
+      } catch (e) {
+        return err(`Could not change the default test-data row: ${describeError(e)}`);
       }
     },
   );

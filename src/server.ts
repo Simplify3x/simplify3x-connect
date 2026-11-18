@@ -13,13 +13,21 @@ import { registerBacklogTools } from './tools/backlog.tools.js';
 import { registerRunTools } from './tools/run.tools.js';
 import { registerSuiteManageTools } from './tools/suiteManage.tools.js';
 import { registerExecutionPlanTools } from './tools/executionPlan.tools.js';
+import { registerReleaseSprintTools } from './tools/releaseSprint.tools.js';
+import { registerDefectUpdateTool } from './tools/defectUpdate.tools.js';
+import { registerDefectFromStepTools } from './tools/defectFromStep.tools.js';
 import { registerTestPlanTools } from './tools/testPlan.tools.js';
 import { registerPipelineTools } from './tools/pipeline.tools.js';
 import { registerFailureTools } from './tools/failure.tools.js';
+import { registerFailureExportTools } from './tools/failureExport.tools.js';
+import { FailureAnalysisStore, ownerKey } from './tools/failureAnalysisStore.js';
+import type { FailureAnalysis } from './adapters/simplifyqa/failureAnalysisTypes.js';
 import { registerTestdataTools } from './tools/testdata.tools.js';
 import { registerPreferenceTools } from './tools/preference.tools.js';
 import { registerAttachmentTools } from './tools/attachment.tools.js';
 import { registerProjectTools } from './tools/project.tools.js';
+import { registerEnvironmentTools } from './tools/environment.tools.js';
+import { registerImportTools } from './tools/import.tools.js';
 import { registerFormulaTools } from './tools/formulas.tools.js';
 import { registerDefectTools } from './tools/defects.tools.js';
 import { registerTaskTools } from './tools/tasks.tools.js';
@@ -89,11 +97,25 @@ export type ServerDeps = {
    *  header-primed connections win over the startup adapter. */
   connection?: QaConnection | undefined;
   mode?: 'connected' | 'offline' | undefined;
+  /** Startup project id — scopes stored failure analyses when there is no live connection. */
+  projectId?: string | undefined;
+  /** Failure-analysis store; defaults to the process-wide one (tests pass their own). */
+  failureStore?: FailureAnalysisStore<FailureAnalysis> | undefined;
   drafts?: DraftStore | undefined;
   walnutUiOrigin?: string | undefined;
   agentUrl?: string | undefined;
   openEditorWindow?: ((url: string, title: string) => Promise<boolean>) | undefined;
+  /** False when the server is reachable from other machines: then a caller-supplied `outDir` is ignored
+   *  and files go under `<cwd>/qa-reports` (tools/outDir.ts). Default true (stdio / loopback). */
+  allowOutDir?: boolean | undefined;
 };
+
+/**
+ * ONE failure-analysis store per process. mount.ts builds a server per HTTP session, so a per-build
+ * store would lose every analysis on a client reconnect. Isolation is by owner (token hash + project),
+ * not by server instance.
+ */
+const sharedFailureStore = new FailureAnalysisStore<FailureAnalysis>();
 
 const OFFLINE_TOOLS = ['actions_catalog', 'tc_draft_create', 'tc_draft_update', 'tc_draft_get', 'tc_draft_discard', 'tc_draft_open'];
 
@@ -162,15 +184,17 @@ export function recordingInstructionsFor(provider: 'walnut' | 'simplifyqa' | 'un
       'READS / QUERIES: `sqa_query` is the ONLY read tool on SimplifyQA. Use it for EVERY fetch, query, list, search, get, read or count — the old per-collection reads (tc_list, tc_get, story_list, story_get, epic_list, feature_list, list_modules, list_functions, suite_list, list_users, object_list, defect_list, task_list, list_releases, list_sprints, journal_grep, …) are NOT registered. Do not look for them and do not invent one. This includes projects (works with no project selected): "how many projects" → `{ op:"count", collection:"projects" }` (an admin sees every project in the tenant); "my projects" → add `where:[{ field:"member", value:true }]`.',
       '  Flow: `sqa_query({ op:"catalog" })` (or `catalog` with a collection) → `{ op:"search", collection, where, sort, limit }` or `{ op:"get", collection, id }` → `{ op:"related", collection, id, relation }`. Any "show / list / find / get / fetch / count ..." request goes here.',
       '  It always filters `deleted:false`, scopes to the active project, rejects unknown fields locally, and resolves custom fields: `op:"custom_fields"` returns label → key → `customFields.<key>`; then pass the label with `custom:true` in `where`. Test cases have NO priority/status columns — use `reviewApproveStatus` or a custom field. The one exception is a FAILED run: analyse it with `failure_analysis` (below), not by reading its steps with `sqa_query`.',
-      'COLUMN PREFERENCES (user-level, per list view): `column_preference({ action:"set", lists:["epic","feature","userstory"], column:"Created On" })` shows that column in the SimplifyQA UI list view (the same write as ticking it in Column Preference); `enabled:false` hides it; `action:"get"` reports the current columns. It takes effect on the UI after a refresh.',
+      'COLUMN PREFERENCES (user-level, per list view): `column_preference({ action:"set", lists:["epic","feature","userstory"], column:"Created On" })` shows that column in the SimplifyQA UI list view (the same write as ticking it in Column Preference); `enabled:false` hides it; `action:"get"` reports the current columns. Lists: epic, feature, userstory, testcase (Test Case list), suite (Suite test cases), scenario (Test plan test cases), executionplan (Execution Plan test cases — e.g. column:"Execution Type"). It takes effect on the UI after a refresh.',
+      'SPREADSHEET IMPORT: `excel_import({ filePath:"<absolute path>", kind:"testcases"|"testdata"|"plan_entries" })` reads .xlsx/.csv/.tsv the way the UI Import does. testcases: one MANUAL TC per row (name/title required; description, steps (newline or | separated), expected result, module, story headers). testdata: needs tcId + environmentType, one iteration per row, columns = parameter names. plan_entries: needs planId, first column = test case codes. It reports created/added and every rejected row; `dryRun:true` writes nothing. Never say the MCP cannot import a spreadsheet.',
       'ATTACHMENTS (epic / feature / user story): `attachment_add({ entityType:"epic"|"feature"|"userstory", itemId, filePath:"<absolute path>" })` uploads one file and reads the item\'s attachments back to confirm; the file appears in the UI\'s Attachments section. A screenshot pasted in chat has no local path — ASK for its absolute path (or accept base64 + fileName). `attachment_delete({ entityType, itemId, attachment })` removes a wrong upload.',
       'WATCH LIST (the UI email button): `epic_create` / `feature_create` / `story_create` accept `watchList:["email-or-name-or-id", …]`; for an existing item use `watch_list_add({ entityType, itemId, users:[…] })`. Emails/names/ids resolve to user ids and the item is re-read to confirm. Never say you cannot set the Watch List.',
       'LINKAGES (the UI Linkages section): `backlog_link({ sourceType:"epic"|"feature"|"userstory", sourceId, destType:"defect"|"epic"|"feature"|"userstory"|"task", destId, linkType:"Clones" })`. linkType is the displayed link-type name; it is matched to the project link-type config (unknown → refused with the list) and the link is read back from /pm/linkages.',
       'PROJECTS: `project_create({ name, description?, users? })` creates a project (the admin Project screen form), reads it back and returns its id + PR code — then `qa_switch_project` to work in it. `project_delete` is TWO-STEP (preview, then confirm:true). Never say you cannot create a project.',
+      'ENVIRONMENTS: `environment_manage({ action:"create", name:"Mcp env" })` creates a project environment (project configuration > Environments, next to General) with the UI\'s exact key format; `action:"update", environment:"<current name or key>", name?/key?` renames or re-keys one; `action:"delete", environment:"…"` is TWO-STEP (preview, then confirm:true, General refused). Every write posts the whole environment list to /pm/fields/savefields exactly as the UI does and is read back to confirm. The saved environment is selectable for executions, schedules, pipelines and execution plans (read them with `sqa_query` collection "environments"). Never say the MCP cannot create an environment.',
       '',
       'TEST EXECUTION (SimplifyQA): suites `suite_manage`, execution plans `execution_plan`, test plans `test_plan`, pipelines `pipeline`, schedules via `schedule_*` (and `tc_run` / `suite_run` with when:"schedule"; execution plans cannot be scheduled - the SimplifyQA Scheduler takes a test case or a suite). Every DELETE (a test case, a suite, a plan/folder, an execution plan) is TWO-STEP: the first call only previews - show it, and call again with confirm:true ONLY after the user explicitly says so. Start a run or create a schedule ONLY on an explicit instruction. SimplifyQA execution plans run LOCALLY only. SimplifyQA has no pause for a schedule (cancel it, or give it a new start time). Removing ONE test case from a test plan is a plain edit, not a delete: `test_plan({ action:"remove_testcase", testPlanId, tcId })` removes only that case, is re-read to confirm, and leaves the suites, other test cases and sub-folders alone (re-add it with action:"add").',
       '',
-      'FAILED RUNS: call `failure_analysis({ code })` with TC-123 / SU-123 / PL-123 (PL = execution plan) for its latest execution, add `executionId` (or pass it alone) to analyse only that execution. It returns an ANALYSIS CARD (tables: "Why … failed" and "Failed test cases" with Report Step No. and Test case step) followed by evidence. START YOUR REPLY WITH THE CARD EXACTLY AS RETURNED — same tables, rows and columns, never summarised or reworded — then add Why and Fix for each cause # from the evidence. Do not assert a cause the evidence does not support.',
+      'FAILED RUNS: call `failure_analysis({ code })` with TC-123 / SU-123 / PL-123 (PL = execution plan) for its latest execution; add `executionId` to analyse that code inside only that execution (or pass `executionId` alone for the whole execution). Pass `codes:[…]` / `executionIds:[…]` to analyse several together. It returns an `analysisId` and a card (failures by category, patterns, failed test cases) followed by evidence; page unseen patterns with `failure_analysis({ analysisId, pattern:[…] })` as its "Next:" line says, then review every failed test case with `failure_analysis({ analysisId, review: true })` page by page (failed vs baseline vs last-passed screenshots and the data of both steps). Then call `failure_analysis_classify` ONCE with a verdict for every pattern, and START YOUR REPLY WITH THE CLASSIFIED CARD IT RETURNS EXACTLY AS RETURNED — same tables, rows and columns, never summarised or reworded — then add Why and Fix per pattern from the evidence; `failure_analysis_export` writes the Excel / PDF report. Do not assert a cause the evidence does not support.',
       '',
       'Rules while recording (all technologies):',
       '- Record ONLY what the user asked for. Do NOT add extra verify/validate steps unless the user says "verify" / "assert" / "check".',
@@ -223,6 +247,7 @@ export function buildServer(deps: ServerDeps): McpServer {
   const toolServer = provider === 'simplifyqa' ? skipTools(server, SQA_GENERIC_READ_TOOLS) : server;
 
   server.registerTool('project_info', {
+    title: 'Check the connection and project',
     description: 'Validate the configured connection and return provider, org/project and entity counts.',
     inputSchema: {}, annotations: { readOnlyHint: true },
   }, async () => {
@@ -289,6 +314,7 @@ export function buildServer(deps: ServerDeps): McpServer {
   // provider adapter per call -- the live connection wins over the startup adapter, like project_info.
   registerDiscoveryTools(toolServer, {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+    allowOutDir: deps.allowOutDir !== false,
     // tc_save_as_new_version({ fromDraftId }) freezes an EDITED draft — read it from the same store
     // the testcase tools write to. A missing/expired draft returns null (the tool reports it).
     getDraft: (draftId: string) => {
@@ -328,9 +354,23 @@ export function buildServer(deps: ServerDeps): McpServer {
   // Run surface (cloud_runners / tc_run / run_status / run_stop) -- same live-connection-wins rule;
   // the run is forwarded to the product MCP (local dispatches to the agent, cloud to a runner VM).
   // `getProjectId` keys the in-session "reuse last run config?" prompt to the connected project.
-  registerFailureTools(toolServer, {
+  // Failure Analysis v2: the process-wide store (survives per-session rebuilds), shared by
+  // analyse/view/classify and export; entries are scoped to the owner (token hash + project).
+  const failureStore = deps.failureStore ?? sharedFailureStore;
+  const failureDeps = {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
-  });
+    allowOutDir: deps.allowOutDir !== false,
+    getOwnerKey: (): string | null => {
+      if (deps.connection) {
+        const c = deps.connection.config();
+        return c.mode === 'connected' ? ownerKey(c.token, c.projectId) : null;
+      }
+      return deps.adapter ? `local:${deps.projectId ?? ''}` : null;
+    },
+    store: failureStore,
+  };
+  registerFailureTools(toolServer, failureDeps);
+  registerFailureExportTools(toolServer, failureDeps);
 
   registerRunTools(toolServer, {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
@@ -346,6 +386,15 @@ export function buildServer(deps: ServerDeps): McpServer {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
   });
   registerExecutionPlanTools(toolServer, {
+    getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+  });
+  registerReleaseSprintTools(toolServer, {
+    getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+  });
+  registerDefectUpdateTool(toolServer, {
+    getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+  });
+  registerDefectFromStepTools(toolServer, {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
   });
 
@@ -378,6 +427,16 @@ export function buildServer(deps: ServerDeps): McpServer {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
   });
 
+  // Project environments (create / rename) — the project configuration's Environment editor.
+  registerEnvironmentTools(toolServer, {
+    getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+  });
+
+  // Spreadsheet import (.xlsx / .csv / .tsv) — test cases, test data, execution-plan entries.
+  registerImportTools(toolServer, {
+    getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+  });
+
   // Formula discovery (tc_list_formulas) — companion to tc_generate_testdata's `formulas` option, so
   // the model can enumerate DEFAULT prefabs + CUSTOM formulas before picking one.
   registerFormulaTools(toolServer, {
@@ -403,6 +462,7 @@ export function buildServer(deps: ServerDeps): McpServer {
 
   registerReportTools(server, {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+    allowOutDir: deps.allowOutDir !== false,
   });
 
   // Coverage / gap aggregator across a scope (sprint / release / epic / feature / stories / project).

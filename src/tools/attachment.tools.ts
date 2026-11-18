@@ -9,10 +9,12 @@
 
 import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
+import { resolveHosted } from '../defaults.js';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
+import type { AttachmentDownloadResult } from '../adapters/simplifyqa/adapter.js';
 
 export type AttachmentDeps = { getAdapter: () => ProviderAdapter | null };
 
@@ -24,6 +26,13 @@ type AttachmentWrites = {
     contentType?: string | undefined;
     data: Uint8Array;
   }) => Promise<{ id?: string; name: string; attachments: Array<Record<string, unknown>> }>;
+  downloadAttachments: (input: {
+    entityType: 'epic' | 'feature' | 'userstory';
+    itemId: string;
+    attachments?: string[] | undefined;
+    all?: boolean | undefined;
+    outDir: string;
+  }) => Promise<AttachmentDownloadResult>;
   removeAttachment: (input: {
     entityType: 'epic' | 'feature' | 'userstory';
     itemId: string;
@@ -54,7 +63,10 @@ export function registerAttachmentTools(server: McpServer, deps: AttachmentDeps)
         'Upload ONE file and attach it to an existing backlog item, then read the item\'s attachments ' +
         'back to confirm it is there (it will appear in the item\'s Attachments section in the UI). ' +
         'Pass the file as a LOCAL `filePath` (preferred — e.g. the screenshot path the user shared), ' +
-        'or as `base64` + `fileName` when only the bytes are available. Max 20 MB.',
+        'or as `base64` + `fileName` when only the bytes are available. Max 20 MB.' +
+        (resolveHosted()
+          ? ' THIS SERVER IS SHARED: it cannot read files by path. Always send `base64` + `fileName`.'
+          : ''),
       inputSchema: {
         entityType: z.enum(['epic', 'feature', 'userstory']).describe('Which backlog item to attach to.'),
         itemId: z.string().describe('Item id or business key (EP-66, FT-266, US-1326).'),
@@ -72,6 +84,11 @@ export function registerAttachmentTools(server: McpServer, deps: AttachmentDeps)
       try {
         let data: Uint8Array;
         let name = (fileName ?? '').trim();
+        if (filePath && resolveHosted()) {
+          // A shared server must never read its own disk on a caller's behalf: that would let any
+          // user upload the pod's files (service-account token, environment) to where they can see them.
+          return err('This server cannot read files by path. Send the file content as `base64` together with `fileName`.');
+        }
         if (filePath) {
           data = new Uint8Array(await readFile(filePath));
           if (!name) name = basename(filePath);
@@ -125,6 +142,58 @@ export function registerAttachmentTools(server: McpServer, deps: AttachmentDeps)
         );
       } catch (e) {
         return err(`Could not remove the attachment from ${entityType} ${itemId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    'attachment_download',
+    {
+      title: 'Download an attachment of an epic, feature or user story (SimplifyQA)',
+      description:
+        'DOWNLOAD attachments of an epic, feature or user story from SimplifyQA to a local folder — fetched from SimplifyQA with the user\'s login ' +
+        '(not copied from a local file). Pass `entityType` + `itemId` (EP-69, FT-269, US-1330). If the item has ONE attachment it is downloaded; if it has ' +
+        'SEVERAL and you pass no choice, the tool LISTS them (name, size, id) — show that list to the user and call again with `attachments` (names or ids, ' +
+        'one or several) or `all:true`. `outDir` is the folder to save into (default "./exports"; created if missing). The answer gives each saved path, ' +
+        'file name and size and says whether the size matches what SimplifyQA reports; an existing file is never overwritten (a " (1)" is added).' +
+        (resolveHosted()
+          ? ' THIS SERVER IS SHARED: it cannot save files. Tell the user to download attachments from the item in SimplifyQA.'
+          : ''),
+      inputSchema: {
+        entityType: z.enum(['epic', 'feature', 'userstory']).describe('Which backlog item the attachment belongs to.'),
+        itemId: z.string().describe('Item id or business key (EP-69, FT-269, US-1330).'),
+        attachments: z.array(z.string()).optional().describe('Which attachments: file names or ids (one or several). Omit to be shown the list when there is more than one.'),
+        all: z.boolean().optional().describe('true = download every attachment of the item.'),
+        outDir: z.string().optional().describe('Folder to save into. Default "./exports".'),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ entityType, itemId, attachments, all, outDir }) => {
+      const adapter = deps.getAdapter() as (ProviderAdapter & Partial<AttachmentWrites>) | null;
+      if (!adapter) return err(NOT_CONNECTED);
+      if (!adapter.downloadAttachments) return err('Downloading attachments is available only on a SimplifyQA connection.');
+      // A shared server must never write to its own disk for a caller: users cannot reach those files,
+      // and a caller-chosen outDir would let anyone write wherever the server process can.
+      if (resolveHosted()) return err(`This server cannot save files. Download the attachments from ${entityType} ${itemId} in SimplifyQA.`);
+      try {
+        const res = await adapter.downloadAttachments({ entityType, itemId, ...(attachments?.length ? { attachments } : {}), ...(all ? { all } : {}), outDir: outDir ?? './exports' });
+        const kb = (n?: number): string => (n === undefined ? 'size not reported' : `${n} bytes`);
+        if (res.needsChoice) {
+          return ok(
+            `${entityType} ${itemId} has ${res.available.length} attachments:\n` +
+              res.available.map((a, i) => `${i + 1}. ${a.name} (${kb(a.bytes)}, id ${a.id})`).join('\n') +
+              '\nNothing was downloaded. ASK the user which to download — one, several or all — then call attachment_download again with `attachments` (names or ids) or `all:true`.',
+            { needsChoice: true, available: res.available } as unknown as Record<string, unknown>,
+          );
+        }
+        const lines = res.files.map((f) => `- ${f.path} — ${f.name}, ${f.bytes} bytes${f.sizeMatches === true ? ' (matches the size SimplifyQA reports)' : f.sizeMatches === false ? ` (SimplifyQA reports ${f.reportedBytes})` : ' (SimplifyQA reports no size)'}`);
+        return ok(
+          `Downloaded ${res.files.length} attachment${res.files.length === 1 ? '' : 's'} of ${entityType} ${itemId} from SimplifyQA:\n${lines.join('\n')}` +
+            (res.warnings.length ? '\n' + res.warnings.map((w) => `⚠️ ${w}`).join('\n') : ''),
+          { ...res } as unknown as Record<string, unknown>,
+        );
+      } catch (e) {
+        return err(`Could not download from ${entityType} ${itemId}: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   );

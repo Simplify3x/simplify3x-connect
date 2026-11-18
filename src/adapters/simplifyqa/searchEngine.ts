@@ -19,6 +19,7 @@ import {
 } from './searchResolve.js';
 import { childrenOf, descendants, folderStats, memberIds } from './planTree.js';
 import { mapLimit } from './mapLimit.js';
+import { resolveValuesEnabled } from '../../defaults.js';
 import {
   resolveCollection,
   SQA_COLLECTIONS,
@@ -249,7 +250,7 @@ export type SqaEngineOptions = {
 
 /** Value resolution is on by default; `QA_MCP_SQA_RESOLVE=off|0|false|no` turns it off (kill switch). */
 export function resolveValuesFromEnv(env: NodeJS.ProcessEnv): boolean {
-  return !/^(off|0|false|no)$/i.test((env['QA_MCP_SQA_RESOLVE'] ?? '').trim());
+  return resolveValuesEnabled(env);
 }
 
 export class SqaSearchEngine {
@@ -645,8 +646,10 @@ export class SqaSearchEngine {
     // Rows the product hides unless asked (obsolete test cases): `$nor {field:true}` keeps
     // false AND missing, as the UI does. Naming the field in a filter turns this off.
     if (this.resolvesValues && !req.includeHidden) {
-      for (const hidden of c.hiddenUnlessAsked ?? []) {
-        if (!(req.where ?? []).some((w) => w.field === hidden)) {
+      for (const entry of c.hiddenUnlessAsked ?? []) {
+        const hidden = typeof entry === 'string' ? entry : entry.field;
+        const asking = [hidden, ...(typeof entry === 'string' ? [] : entry.askedBy)];
+        if (!(req.where ?? []).some((w) => asking.includes(w.field))) {
           searchFields.push({ column: hidden, value: true, operator: 'nor' });
         }
       }

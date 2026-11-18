@@ -14,6 +14,10 @@ export type Condition = {
   text?: string | undefined;
   variableName?: string | undefined;
   variableValue?: string | undefined;
+  /** An element check by the object's name instead of its id. */
+  objectName?: string | undefined;
+  /** AND / OR — how this check joins the next one when a step carries several. */
+  logical?: string | undefined;
 };
 export type Step = {
   n: number; description: string; actionType: string;
@@ -42,6 +46,8 @@ export type Step = {
   controlFlow?: {
     kind: string;
     condition?: Condition | undefined;
+    /** Several checks (joined by each one's `logical`); `condition` is the one-check shorthand. */
+    conditions?: Condition[] | undefined;
     /** Raw ifstring from SQA's `conditions.ifstring` — the human-readable expression as shown in the UI. */
     conditionText?: string | undefined;
     blockId?: string | undefined;
@@ -765,6 +771,16 @@ export const SCHEDULE_TYPES = ['once', 'every_5_minutes', 'hourly', 'daily', 'we
 export type ScheduleType = typeof SCHEDULE_TYPES[number];
 
 export type ScheduleOptions = {
+  /** REPEAT EVERY N (hourly / daily / weekly / monthly): N hours / days / weeks / months, 1 or more. Not for once / every_5_minutes. */
+  interval?: number;
+  /** Weekly: the weekdays to run on (MONDAY … or MON …); default = the start's weekday. Monthly + occurrence: the ONE weekday. */
+  daysOfWeek?: string[];
+  /** Monthly "ON DAY": 1–30; default = the start's day. */
+  dayOfMonth?: number;
+  /** Monthly "ON THE": the first / second / third / last weekday (give the weekday in daysOfWeek). */
+  occurrence?: 'first' | 'second' | 'third' | 'last';
+  /** The schedule's name (3–501 characters, unique in the project). Omitted → "<TC-22> schedule", numbered when that is taken. */
+  name?: string;
   /** Where the scheduled run executes: 'local' (THIS machine's agent), 'remote' (a teammate's
    *  registered agent) or 'cloud' (a cloud runner VM). */
   mode: 'local' | 'remote' | 'cloud';
@@ -801,12 +817,14 @@ export type ScheduleOptions = {
   timezone?: string;
 };
 /** Neutral reference to a created schedule (from POST /api/schedules `data`). */
-export type ScheduleRef = { id: string; status?: string; nextRunAt?: string; productUrl?: string };
+export type ScheduleRef = { id: string; name?: string; status?: string; nextRunAt?: string; productUrl?: string; notes?: string[] };
 /** A schedule as listed for management (GET /api/schedules). `target` names WHAT it runs (a test case
  *  or a suite), `agent` is the pinned agent/runner's human name, and `updateVersion` is the optimistic-
  *  concurrency token an edit must echo back. */
 export type ScheduleInfo = {
   id: string;
+  /** The schedule's own name (as the Scheduler shows it). */
+  name?: string;
   target: string;               // e.g. "TC_2271 — Login" or "Suite: Smoke"
   scheduleType: string;         // once / hourly / daily / ...
   status: string;               // scheduled / running / paused / cancelled / ...
@@ -822,6 +840,23 @@ export type ScheduleInfo = {
 /** Fields an edit may change (schedule_update). Omitted = leave as-is. Mirrors updateScheduleSchema;
  *  `mode:'local'` re-pins via agentId, `mode:'cloud'` via cloudRunnerCredentialId. */
 export type ScheduleUpdate = {
+  /** REPEAT EVERY N (hourly / daily / weekly / monthly): N hours / days / weeks / months, 1 or more. Not for once / every_5_minutes. */
+  interval?: number;
+  /** Weekly: the weekdays to run on (MONDAY … or MON …); default = the start's weekday. Monthly + occurrence: the ONE weekday. */
+  daysOfWeek?: string[];
+  /** Monthly "ON DAY": 1–30; default = the start's day. */
+  dayOfMonth?: number;
+  /** Monthly "ON THE": the first / second / third / last weekday (give the weekday in daysOfWeek). */
+  occurrence?: 'first' | 'second' | 'third' | 'last';
+  /** Rename the schedule (3–501 characters, unique in the project). */
+  name?: string;
+  /** Change WHAT it runs: a test case (the schedule becomes a Test Case schedule) or a suite (a Suite schedule) — the same schedule id.
+   *  Give one of them, not both. */
+  tcId?: string;
+  suiteId?: string;
+  /** Release / sprint (id, code or exact name; "none" clears) — a suite schedule needs a release. */
+  releaseId?: string;
+  sprintId?: string;
   scheduledFor?: string;
   scheduleType?: ScheduleType;
   endDate?: string;

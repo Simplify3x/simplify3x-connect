@@ -297,7 +297,7 @@ export function registerQueryTools(server: McpServer, deps: QueryToolsDeps): voi
       inputSchema: {
         op: z.enum(['catalog', 'search', 'get', 'related', 'custom_fields', 'count']).describe('Operation to run. "count" returns how many rows match (with `groupBy`, per value).'),
         groupBy: z.string().optional().describe('For op:"count": the field to break the count down by (e.g. "state", "severity", "ownerId", "tcType").'),
-        includeHidden: z.boolean().optional().describe('Include rows hidden by default (obsolete test cases). Naming the field in `where` does the same.'),
+        includeHidden: z.boolean().optional().describe('Include rows hidden by default (obsolete test cases; child runs and re-execution copies of executions). Naming the field in `where` does the same.'),
         allVersions: z.boolean().optional().describe('Stories/epics: return every version row instead of one row per item.'),
         collection: z.string().optional().describe('Collection name or alias (testcases, tc, stories, defects, executions, ...). Required except for catalog.'),
         where: z.preprocess(asWhereArray, z.array(zWhere)).optional().describe('Filters, an ARRAY of { field, op?, value }. Combined with AND unless a filter sets condition:"or". Example: [{ field:"name", op:"contains", value:"login" }].'),

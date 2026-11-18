@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
 import type { BacklogKind } from '../domain/types.js';
+import type { BacklogUnlinkResult } from '../adapters/simplifyqa/adapter.js';
 
 /**
  * Backlog CRUD tools for the epic → feature → user-story hierarchy. Mirrors the shape of
@@ -141,6 +142,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
         'raw HTML — see the description field docstring for the exact allowed tags and required ' +
         'section structure. One-line summaries are not acceptable.** `customFields` may be omitted — ' +
         'an empty object is sent automatically.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         name: z.string().min(3).max(500).describe('Epic name (3–500 chars).'),
         estimatedEffort: z.number().nonnegative().describe('Estimated effort (hours).'),
@@ -220,6 +222,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
         'PATCH an existing EPIC — pass only the fields to change plus `updateVersion` (optimistic ' +
         'concurrency, from the last epic_get). Accepts id or business key (EP_123). ' +
         'Cannot rename the epic to a duplicate of another epic in the same customer.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         id: z.string().describe('Epic id or business key (EP_123).'),
         name: z.string().min(3).max(500).optional(),
@@ -346,6 +349,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
         'markdown) — SQA UI renders it via a Tiptap editor. See the description field docstring for ' +
         'the exact allowed tags and required section structure. One-line summaries are not ' +
         'acceptable.** `customFields` may be omitted — an empty object is sent automatically.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         name: z.string().min(3).max(500),
         estimatedEffort: z.number().nonnegative(),
@@ -436,6 +440,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
       description:
         'PATCH an existing FEATURE — pass only the fields to change plus `updateVersion` (optimistic ' +
         'concurrency, from the last feature_get). Accepts id or business key (FT_123).',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         id: z.string().describe('Feature id or business key (FT_123).'),
         name: z.string().min(3).max(500).optional(),
@@ -494,6 +499,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
         'required section structure, and Given/When/Then format for AC. One-line descriptions and ' +
         '3-line AC lists are not acceptable.** `customFields` may be omitted — an empty object is ' +
         'sent automatically.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         name: z.string().min(3).max(500),
         estimatedEffort: z.number().nonnegative(),
@@ -608,6 +614,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
         'PATCH an existing USER STORY — pass only the fields to change plus `updateVersion` ' +
         '(optimistic concurrency, from the last story_get). Accepts id or business key (US_123). ' +
         'Pass `acceptanceCriteria` as a newline-separated string when replacing AC lines.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         id: z.string().describe('Story id or business key (US_123).'),
         name: z.string().min(3).max(500).optional(),
@@ -755,6 +762,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
         'Add people to an item\'s WATCH LIST — the same list the UI\'s email button edits. `users` takes ' +
         'emails, full names or numeric userIds (e.g. ["rohini.k@simplify3x.com"]). Existing watchers are ' +
         'kept; the item is re-read to confirm. Use it after creating an item, or for an existing one.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         entityType: z.enum(['epic', 'feature', 'userstory']).describe('Which backlog item.'),
         itemId: z.string().describe('Item id or business key (EP-66, FT-266, US-1326).'),
@@ -788,6 +796,7 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
         '"Clones" (case-insensitive; the available types are read from the project\'s link-type config ' +
         'and an unknown one is refused with the list). `destType` is the DESTINATION issue type ' +
         '(e.g. "defect"). The link is saved on the SOURCE item and read back from /pm/linkages to confirm.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         sourceType: z.enum(['epic', 'feature', 'userstory']).describe('Item that owns the Linkages section.'),
         sourceId: z.string().describe('Source item id or business key (EP-64, FT-266, US-1326).'),
@@ -806,6 +815,47 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
           `Linked ${sourceType} ${sourceId} → ${destType} ${res.destinationCode ?? destId} (${linkType}, key ${res.linkTypeKey}). ` +
           `Links now: ${res.linkedIssues.map((l) => `${l['destinationCode'] ?? l['destinationId']} (${l['linkTypeKey']})`).join(', ') || '(none)'}`,
           { sourceType, sourceId, destType, destId, linkTypeKey: res.linkTypeKey, links: res.linkedIssues } as unknown as Record<string, unknown>,
+        );
+      } catch (e) {
+        return err(describeError(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    'backlog_unlink',
+    {
+      title: 'Remove a link between two backlog items (Linkages)',
+      description:
+        'DELETE a LINK between two backlog items — the UI\'s Linkages delete (the opposite of backlog_link). Pass the item that owns the link ' +
+        '(`sourceType` + `sourceId`, e.g. epic EP-71) and the item it points to (`destType` + `destId`, e.g. defect DE-2293). If the source has more than one ' +
+        'link to that item, say which with `linkType` (e.g. "Clones"). The link disappears from BOTH items\' Linkages; the tool reads the source\'s ' +
+        'Linkages back to confirm and checks the other side too. A link that is not there is reported with the links the source does have. ' +
+        'Deleting is final — call it only when the user asked to remove the link.',
+      inputSchema: {
+        sourceType: z.enum(['epic', 'feature', 'userstory', 'defect', 'task']).describe('Item type that owns the Linkages row.'),
+        sourceId: z.string().describe('Source item id or business key (EP-71, FT-266, US-1326, DE-2293, TA-3).'),
+        destType: z.enum(['epic', 'feature', 'userstory', 'defect', 'task']).describe('The linked item\'s type.'),
+        destId: z.string().describe('The linked item\'s id or business key (DE-2293).'),
+        linkType: z.string().optional().describe('Link type name or key (e.g. "Clones") — needed only when the source has several links to that item.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    async ({ sourceType, sourceId, destType, destId, linkType }) => {
+      const adapter = deps.getAdapter() as (ProviderAdapter & {
+        unlinkBacklogItem?: (input: { sourceType: string; sourceId: string; destType: string; destId: string; linkType?: string | undefined }) => Promise<BacklogUnlinkResult>;
+      }) | null;
+      if (!adapter) return err(NOT_CONNECTED);
+      if (!adapter.unlinkBacklogItem) return err('Linkages are available only on a SimplifyQA connection.');
+      try {
+        const res = await adapter.unlinkBacklogItem({ sourceType, sourceId, destType, destId, ...(linkType ? { linkType } : {}) });
+        return ok(
+          [
+            `Removed the link ${res.sourceCode} → ${res.destinationCode} (${res.removed.join(', ')}) and read the Linkages back: it is gone.`,
+            `${res.sourceCode}'s links now: ${res.remaining.join(', ') || '(none)'}.`,
+            ...res.warnings.map((w) => `⚠️ ${w}`),
+          ].join('\n'),
+          { ...res } as unknown as Record<string, unknown>,
         );
       } catch (e) {
         return err(describeError(e));

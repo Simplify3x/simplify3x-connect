@@ -221,6 +221,24 @@ export async function saveJournalFallback(
   };
 }
 
+/** After a recorder save, make sure no version of the test case was left with typeless test-data cells (the
+ *  recorder window can write them into the wrong version, which then cannot load its test data or run).
+ *  Best-effort: returns a line for the reply, or '' when everything is fine / the provider cannot check. */
+export async function healTestdata(adapter: ProviderAdapter, tcId: string): Promise<string> {
+  const repair = (adapter as ProviderAdapter & Partial<{
+    repairTestdataCells(id: string): Promise<{ checked: number; repaired: number; versions: string[] }>;
+  }>).repairTestdataCells;
+  if (!repair) return '';
+  try {
+    const r = await repair.call(adapter, tcId);
+    return r.repaired > 0
+      ? `\nRepaired ${r.repaired} test-data cell(s) that had no type in ${r.versions.join(', ')} — that version could not load its test data or run.`
+      : '';
+  } catch (e) {
+    return `\n⚠️ Could not verify the test data of every version: ${describeError(e)}.`;
+  }
+}
+
 /**
  * Asks a SEPARATELY-RUNNING local Walnut agent to draw the editor in its own
  * Electron window, over a loopback HTTP call to POST /editor/open.
@@ -381,6 +399,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         'Same three steps also apply to applying a `story_sync_testcases` drift report (pass the ' +
         'filtered `proposedOps` at step 2 instead of a set_meta patch). Requires a live connection ' +
         '(qa_connect).',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         tcId: z.string().describe('The existing test-case id to load as a draft.'),
       },
@@ -412,6 +431,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         'targeted an existing TC, pass its id via `tcId` so the draft inherits title/module/project ' +
         'and tc_save UPDATES that TC instead of creating a new one. Requires a live connection ' +
         '(qa_connect) with an agent that owns the recording journal.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         sessionId: z.string().describe('The recording session id — the same id used when the recording started.'),
         tcId: z.string().optional().describe('Optional: an existing TC id to inherit title/module/project from (and to UPDATE on save).'),
@@ -487,6 +507,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         'default test-data row (ITR-1) automatically. Steps with no `${...}` tokens create no parameters — ' +
         'that is only correct for pure checklist verifications ("verify heading is visible"). If a step ' +
         'references a real value, tokenise it.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         title: z.string().min(1),
         priority: zPriority.optional(),
@@ -568,6 +589,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         '(the numeric id also works). Its matching `function_end` row is generated automatically and the function\'s NEWEST version is pinned at save, so ' +
         '"use these functions and create a new tc" is just one add_step per function in run order, then tc_save. Do NOT pass a real action name ' +
         '(a function call has no action) and do NOT add `function_end` yourself.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: { draftId: z.string(), ops: z.array(zDraftOp).min(1) },
     },
     async ({ draftId, ops }) => {
@@ -626,6 +648,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
     {
       title: 'Discard a test-case draft',
       description: 'Delete an in-memory draft. Nothing was ever persisted, so there is nothing else to undo.',
+      annotations: { readOnlyHint: false, destructiveHint: true },
       inputSchema: { draftId: z.string() },
     },
     async ({ draftId }) => {
@@ -704,6 +727,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         'and tc_save({ draftId }) to persist. Requires a live connection (qa_connect); the desktop app ' +
         'must be running on the same machine or the window-open call silently no-ops (the draft still ' +
         'mutates correctly — only the live view is lost).',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         tcId: z.string().describe('The existing test-case id to open for editing.'),
         hashRoute: z.string().optional().describe(
@@ -792,6 +816,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         '`desktop_launch_application({ app_path })` first, then `desktop_snapshot` + `desktop_*` verbs.\n\n' +
         'The draft must have been opened via `tc_edit_open` first — its stored sessionId is what binds ' +
         'the recorder to the correct window.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         draftId: z.string().describe('The draft id from tc_edit_open.'),
       },
@@ -848,6 +873,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         'CAVEAT: The recording journal is process-scoped and may contain steps from earlier recordings ' +
         'in the same Java-server process. Pass `fromIndex` to skip the first N steps if the journal ' +
         'accumulated prior state — usually the count of steps recorded before `tc_record_append` was called.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         draftId: z.string(),
         recordingSessionId: z.string().describe(
@@ -1337,6 +1363,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
                   fbCopy = `\n⚠️ Testdata copy from ${copyTestdataFrom} failed: ${describeError(e)}.`;
                 }
               }
+              fbCopy += await healTestdata(adapter, fb.id);
               const fbFormula = fb.formulasApplied
                 ? `\n${fb.formulasApplied} formula(s) were applied to the default test-data row.` +
                   (fb.formulaSkipped?.length ? ` Skipped: ${fb.formulaSkipped.join('; ')}.` : '')
@@ -1386,6 +1413,7 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
             }
           }
         }
+        if (savedVersion || recordingTarget?.testcaseId) copyNote += await healTestdata(adapter, String(id));
         const chosenMatches = selectMatches(fnMatches, replaceWithFunctions);
         const fnNote = chosenMatches.length ? await replaceMatchedRuns(adapter, String(id), chosenMatches) : '';
         // The recorder window stamps the recorded formulas onto the default testdata iteration before

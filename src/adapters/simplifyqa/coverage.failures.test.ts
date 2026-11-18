@@ -11,7 +11,7 @@ import {
   ExecutionFailureAnalysis, FAILURE_LOG_TAIL, fetchFailureImage, type ExecutionFailureDeps,
 } from './executionFailures.js';
 import {
-  CARD_END, failureImages, MAX_INLINE_IMAGES, pickGroupScreenshots, readableTime, renderExecution,
+  CARD_END, readableTime,
 } from './failureReport.js';
 import {
   categoryOf, classify, cleanLogLines, extractCause, isNoiseLine, trimTrace,
@@ -22,7 +22,7 @@ import {
   realFailures, reportStepLabel, runKey, runLabel, stepWhere, UNREACHED_STATUSES,
 } from './stepRules.js';
 import type {
-  ExecutionFailureContext, FailureFlow, FailureIteration, FailureStep, FailureTestcaseEntry,
+  FailureStep,
 } from './failureTypes.js';
 
 type Router = { get?: (url: string) => any; post?: (url: string, body: any) => any };
@@ -144,7 +144,7 @@ describe('ExecutionFailureAnalysis — one failed iteration, end to end', () => 
     expect(ctx.input).toEqual({ code: 'TC-42', resolvedBy: 'latest' });
     expect(ctx.execution).toEqual({
       id: '55', code: 'EX-55', type: 'TESTCASE', status: 'FAILED',
-      executionTypeCode: 'TC-42', executionTypeName: 'Checkout flow', environment: 'QA',
+      executionTypeCode: 'TC-42', executionTypeId: '42', executionTypeName: 'Checkout flow', environment: 'QA',
       startedAt: '2026-10-13T22:16:00.00+05:30', endedAt: '2026-10-13T22:17:30.00+05:30',
       durationMs: 31_000,
       reportUrl: 'https://x.test/user/reports/reports-page?type=TESTCASE&parentId=42&id=55&projectId=7',
@@ -273,7 +273,7 @@ describe('ExecutionFailureAnalysis — run level, unreadable runs and notes', ()
     });
     expect(ctx.groups[0]!.cause).toBe('Run-level: Execution forcefully stopped by admin (last step that ran: 2 "Click")');
     expect(ctx.notes).toEqual([
-      '1 failed iteration(s) could not be read; they are grouped by their run-level exception.',
+      '1 failed iteration(s) could not be read; they are counted by their run-level exception.',
       'Some iterations failed with no failed step (manual verdict or a stop) — their focus is the last step that ran, and the cause is the run-level exception.',
     ]);
     expect(ctx.passed).toBeUndefined();
@@ -569,254 +569,16 @@ function stepOf(over: Partial<FailureStep> = {}): FailureStep {
   };
 }
 
-function iterationOf(over: Partial<FailureIteration> = {}): FailureIteration {
-  const focus = stepOf({ rowId: 'r2', reportStep: '2', testcaseStep: '2', trail: 'TC step 2', cause: 'No such element found' });
-  return {
-    runId: '10', label: 'TC-42 (ITR-1)', testcaseCode: 'TC-42', testcaseName: 'Checkout flow',
-    status: 'FAILED', iteration: 'ITR-1', category: 'Element not found', versionName: 'v1.0',
-    source: 'step', group: 1, focus, failedSteps: [focus],
-    stepCounts: { total: 3, passed: 1, failed: 1, skipped: 0, notExecuted: 1 },
-    ...over,
-  };
-}
-
-function entryOf(iterations: FailureIteration[]): FailureTestcaseEntry {
-  return {
-    executionItemId: '42', code: 'TC-42', name: 'Checkout flow', versionId: 'ver-1', versionName: 'v1.0',
-    iterations: { total: iterations.length, passed: 0, failed: iterations.length, other: 0 },
-    failedIterations: iterations,
-  };
-}
-
-const TESTCASE_CTX: ExecutionFailureContext = {
-  input: { code: 'TC-42', resolvedBy: 'latest' },
-  execution: {
-    id: '55', code: 'EX-55', type: 'TESTCASE', status: 'FAILED',
-    executionTypeCode: 'TC-42', executionTypeName: 'Checkout flow', environment: 'QA',
-    endedAt: '2026-10-13T22:16:59.43+05:30', reportUrl: 'https://x.test/report',
-  },
-  counts: { runs: 3, failedRuns: 1, analysedRuns: 1, testcases: 1, failedTestcases: 1, passedTestcases: 0 },
-  groups: [{
-    id: 1, cause: 'Step 2 "Click Pay" — No such element found', kind: 'step', category: 'Element not found',
-    size: 1, testcases: ['TC-42'], iterations: ['TC-42 (ITR-1)'],
-    representative: 'TC-42 (ITR-1)', representativeRunId: '10',
-  }],
-  testcases: [entryOf([iterationOf()])],
-  notes: [],
-};
-
-describe('failureReport — the analysis card', () => {
-  test('renders a test-case card exactly, then the answer slots, evidence and the tester guide', () => {
-    const text = renderExecution(TESTCASE_CTX);
-    const lines = text.split('\n');
-    const end = lines.indexOf(CARD_END);
-    expect(end).toBeGreaterThan(0);
-    expect(lines.slice(0, end)).toEqual([
-      '**Test case failure analysis: TC-42 — Checkout flow**',
-      'EX-55 · QA · 13 Oct 2026, 10:16 PM',
-      '3 iterations · 2 passed · 1 failed, for 1 reason.',
-      '',
-      '**Why it failed**',
-      '',
-      '| # | Root cause | Iterations failed |',
-      '|---|---|---|',
-      '| 1 | Element not found — Step 2 "Click Pay" — No such element found | TC-42 (ITR-1) |',
-      '',
-      '**Failed iterations**',
-      '',
-      '| Iteration | Report Step No. | Test case step | Failure category |',
-      '|---|---|---|---|',
-      '| ITR-1 | 2 | TC step 2 | Element not found |',
-      '',
-      '**Each failed iteration**',
-      '',
-      '**TC-42 — Checkout flow** (v1.0 · ITR-1 · cause #1)',
-      '**Failed at:** TC step 2  ',
-      '**What failed:** Click Pay  ',
-      '**Error:** `No such element found`  ',
-      '',
-    ]);
-
-    expect(text).toContain('ANSWER — fill in every "…" below and keep this structure exactly');
-    expect(text).toContain('**Cause #1 — Element not found** (TC-42)');
-    expect(text).toContain('- **Where it broke:** TC step 2');
-    expect(text).toContain('- **What went wrong:** `No such element found`');
-    expect(text).toContain('- **Whose problem:** … (test script / test data / application / environment / manual stop) — how sure');
-    expect(text).toContain('Report: https://x.test/report');
-    expect(text).toContain('## Evidence — one representative per cause (for writing Why / Fix; do not paste)');
-    expect(text).toContain('### TC-42 · ITR-1 · cause #1');
-    expect(text).toContain('#### 1. TC step 2 (report step 2) — Click Pay  `FAILED`');
-    expect(text).toContain('- **Failure evidence:**\n  - 10:00:02 ERROR No such element found');
-    expect(text).toContain('- **Logs (last 1 of 1):**\n```text\n10:00:02 ERROR No such element found\n```');
-    expect(text.trimEnd().endsWith('say what to check instead.')).toBe(true);
-  });
-
-  test('escapes table cells, uses the suite/plan columns, and reports an empty execution', () => {
-    const suite: ExecutionFailureContext = {
-      ...TESTCASE_CTX,
-      input: { code: 'SU-7', resolvedBy: 'latest' },
-      execution: {
-        id: '56', code: 'EX-56', type: 'SUITE', status: 'FAILED', executionTypeName: 'Nightly',
-        environment: 'QA', endedAt: '2026-10-13T22:16:59.43Z', exception: 'Stopped `by` admin',
-      },
-      counts: { runs: 4, failedRuns: 2, analysedRuns: 2, testcases: 2, failedTestcases: 1, passedTestcases: 1 },
-      groups: [{
-        id: 1, cause: 'pipe | and\nnewline', kind: 'step',
-        size: 1, testcases: ['TC-42', 'TC-43'], iterations: ['TC-42 (ITR-1)'],
-        representative: 'TC-42 (ITR-1)', representativeRunId: '10',
-      }],
-      passed: ['TC-43'],
-      notes: ['One note.'],
-    };
-    const text = renderExecution(suite);
-    expect(text).toContain('**Suite failure analysis: Nightly**');
-    expect(text).toContain('EX-56 · QA · 14 Oct 2026, 3:46 AM');
-    expect(text).toContain('Execution exception: `Stopped \'by\' admin`');
-    expect(text).toContain('2 test cases · 1 passed · 1 failed, for 1 reason.');
-    expect(text).toContain('| # | Root cause | Test cases |');
-    expect(text).toContain('| 1 | pipe \\| and newline | 2 |');
-    expect(text).toContain('| TC ID | Version | Test case name | Iteration | Report Step No. | Test case step | Failure category |');
-    expect(text).toContain('| TC-42 | v1.0 | Checkout flow | ITR-1 | 2 | TC step 2 | Element not found |');
-    expect(text).toContain('**TC-42 — Checkout flow** (v1.0 · ITR-1 · cause #1)');
-    expect(text).toContain('Passed: TC-43.');
-    expect(text).toContain('One note.');
-
-    const plan: ExecutionFailureContext = {
-      input: { code: 'PL-9', resolvedBy: 'latest' },
-      execution: { id: '57', type: 'EXECUTIONPLAN', status: 'PASSED' },
-      counts: { runs: 2, failedRuns: 0, analysedRuns: 0, testcases: 2, failedTestcases: 0, passedTestcases: 2 },
-      groups: [],
-      testcases: [],
-      notes: [],
-    };
-    const planText = renderExecution(plan);
-    expect(planText).toContain('**Execution plan failure analysis: execution 57**');
-    expect(planText).toContain('2 test cases · 2 passed · 0 failed.');
-    expect(planText).toContain('No test case failed.');
-    expect(planText).toContain('No test case passed.');
-    expect(planText).not.toContain('ANSWER — fill in every');
-    expect(planText).not.toContain('Report:');
-  });
-
-  test('reads times, picks one screenshot per cause group, and fetches them', async () => {
+// The single-execution analysis card (renderExecution / pickGroupScreenshots / failureImages) was replaced
+// by Failure Analysis v2 (failureAnalysisCard.ts, failureReview.ts, failureImages.ts), which has its own tests.
+// The shared helpers that remain in failureReport.ts are pinned here.
+describe('failureReport — shared helpers', () => {
+  test('reads times in IST and passes through what it cannot parse', () => {
     expect(readableTime('2026-10-13T22:16:59.43+05:30')).toBe('13 Oct 2026, 10:16 PM');
     expect(readableTime('2026-10-13T16:46:59.000Z')).toBe('13 Oct 2026, 10:16 PM');
     expect(readableTime('2026-01-01T00:05:00.000Z')).toBe('1 Jan 2026, 5:35 AM');
     expect(readableTime('not a date')).toBe('not a date');
     expect(readableTime(undefined)).toBeUndefined();
-
-    const withShot = iterationOf({
-      focus: stepOf({
-        rowId: 'r2', reportStep: '2', trail: 'TC step 2',
-        screenshots: [
-          { url: '', absoluteUrl: '' },
-          { name: 'failure.png', url: '/files/a.png', absoluteUrl: 'https://x.test/files/a.png' },
-        ],
-      }),
-    });
-    const blind = iterationOf({ runId: '12', label: 'TC-42 (ITR-2)', iteration: 'ITR-2', screenshots: [] } as any);
-    blind.failedSteps = [stepOf({ rowId: 'x', screenshots: [] })];
-    blind.focus = blind.failedSteps[0]!;
-
-    const ctx: ExecutionFailureContext = {
-      ...TESTCASE_CTX,
-      counts: { runs: 4, failedRuns: 2, analysedRuns: 2, testcases: 1, failedTestcases: 1, passedTestcases: 0 },
-      groups: [
-        { ...TESTCASE_CTX.groups[0]!, id: 2, representativeRunId: '12' },
-        { ...TESTCASE_CTX.groups[0]!, id: 1, representativeRunId: '10' },
-      ],
-      testcases: [entryOf([withShot, blind])],
-    };
-    const picked = pickGroupScreenshots(ctx);
-    expect(picked).toHaveLength(1);
-    expect(picked[0]).toEqual({
-      caption: '**Screenshot — cause group 1:** TC-42 (ITR-1) · step 2 "Click Pay"',
-      url: 'https://x.test/files/a.png',
-    });
-    expect(pickGroupScreenshots(ctx, 0)).toEqual([]);
-    expect(MAX_INLINE_IMAGES).toBe(5);
-
-    const images = await failureImages(ctx, async (url) => (url.endsWith('a.png')
-      ? { data: 'AAA', mimeType: 'image/png' }
-      : null));
-    expect(images).toEqual([{ caption: picked[0]!.caption, data: 'AAA', mimeType: 'image/png' }]);
-    expect(await failureImages(ctx, async () => null)).toEqual([]);
-  });
-
-  test('shows run-level wording, tightens a long flow, and renders a step\'s full evidence', () => {
-    const filler = (i: number) => `${i} [PASSED] ${'long line '.repeat(45)}`;
-    const flow: FailureFlow = {
-      lines: [...Array.from({ length: 10 }, (_, i) => filler(i + 1)), ...Array.from({ length: 55 }, (_, i) => filler(i + 11))],
-      breakdown: 'from step 20 on, 8 of 10 steps failed',
-      notRun: ['31 [not run] Sign out'],
-      functionCalls: 'function "Login": this is call 2 of 3; earlier calls: 1 passed',
-      otherIterations: ['ITR-1: passed at this step with amount=250'],
-      warnings: ['step 3: 10:00 WARN slow'],
-    };
-    flow.lines[9] = '10 [FAILED · stopped the run] Click Pay | amount=100';
-    const it = iterationOf({
-      source: 'run_level',
-      focus: stepOf({ rowId: 'r2', reportStep: '10', trail: 'TC step 10', description: 'Click Pay', screenshots: [] }),
-      failedSteps: [],
-      flow,
-      exception: 'Execution stopped',
-    });
-    it.failedSteps = [it.focus!];
-
-    // A second cause: its evidence is the first one that gets a tight FLOW (the budget is spent).
-    const rich = stepOf({
-      rowId: 'r9', seq: 4, reportStep: '4', testcaseStep: '4', trail: 'TC step 4', description: 'Click Pay',
-      objectName: 'Pay button', actionName: 'Click', locator: '//button[@id="pay"]',
-      expected: 'Payment page', actual: 'Error page',
-      exception: 'org.x.NoSuchElement: no such element',
-      apiData: {
-        responseData: { statusCode: 500, responseBody: '{"error":"boom"}' },
-        assertions: [{ key: 'statusCode', condition: 'EQUALS', expectedValue: 200, actualValue: 500, status: 'FAILED' }],
-      },
-      testdata: [{ paramName: 'a', value: '1' }, { paramName: 'p', value: 'secret', protected: true }],
-      screenshots: [{ name: 'failure.png', url: '/files/a.png', absoluteUrl: 'https://x.test/files/a.png' }],
-    });
-    const second = iterationOf({
-      runId: '12', label: 'TC-42 (ITR-3)', iteration: 'ITR-3', group: 2,
-      focus: stepOf({ rowId: 'r7', reportStep: '3', trail: 'TC step 3', screenshots: [] }),
-      failedSteps: [
-        stepOf({ rowId: 'r7', reportStep: '3', trail: 'TC step 3', screenshots: [], description: 'First failure' }),
-        rich,
-        stepOf({ rowId: 'r8', reportStep: '5', trail: 'TC step 5', screenshots: [], description: 'Next' }),
-        stepOf({ rowId: 'r10', reportStep: '6', trail: 'TC step 6', screenshots: [], description: 'Click again' }),
-      ],
-      flow: { lines: ['1 [PASSED] a', '2 [PASSED] b', '3 [FAILED · continued] c', '4 [PASSED] d'], warnings: [] },
-    });
-    const ctx: ExecutionFailureContext = {
-      ...TESTCASE_CTX,
-      groups: [
-        { ...TESTCASE_CTX.groups[0]!, representativeRunId: '10', iterations: ['TC-42 (ITR-1)', 'TC-42 (ITR-2)'] },
-        { ...TESTCASE_CTX.groups[0]!, id: 2, representativeRunId: '12', representative: 'TC-42 (ITR-3)' },
-      ],
-      testcases: [entryOf([it, second])],
-    };
-    const text = renderExecution(ctx);
-    expect(text).toContain('No step reported FAILED — the run was marked failed at run level (manual verdict or a stop).');
-    expect(text).toContain('**Broke down:** from step 20 on, 8 of 10 steps failed');
-    expect(text).toContain('- **Written steps not run** (what the test was going to do next):\n  - 31 [not run] Sign out');
-    expect(text).toContain('- **Function calls:** function "Login": this is call 2 of 3; earlier calls: 1 passed');
-    expect(text).toContain('- **Other iterations of this test case:**\n  - ITR-1: passed at this step with amount=250');
-    expect(text).toContain('- **Warnings from steps that PASSED** (clues, not proof):\n  - step 3: 10:00 WARN slow');
-    expect(text).toContain('- _Same cause, not repeated: TC-42 (ITR-2)_');
-    // step 10 is the failure; evidence also shows the flow lines around it.
-    expect(text).toContain('10 [FAILED · stopped the run] Click Pay | amount=100');
-
-    // The second cause's FLOW is cut to the failure, and its rich step renders every evidence block.
-    expect(text).toContain('_(FLOW cut to the failure to keep the result small.)_');
-    expect(text).toContain('- **Object:** Pay button · **Action:** Click');
-    expect(text).toContain('- **Locator:** `//button[@id="pay"]`');
-    expect(text).toContain('- **Expected:** Payment page');
-    expect(text).toContain('- **Actual:** Error page');
-    expect(text).toContain('- **Exception:** org.x.NoSuchElement: no such element');
-    expect(text).toContain('- **API response:** status 500 · body `{"error":"boom"}`');
-    expect(text).toContain('- **Assertions:**\n  - statusCode EQUALS · expected "200" · actual "500" · FAILED');
-    expect(text).toContain('- **Test data:** a=1, p=***');
-    expect(text).toContain('- **Screenshots:**\n  - [failure.png](https://x.test/files/a.png)');
-    expect(text).toContain('- _1 more failed step(s): 6 Click again_');
+    expect(CARD_END).toBe('---');
   });
 });

@@ -637,7 +637,7 @@ test('createSchedule writes the scheduler form body for a TC and a suite, and re
       releaseId: '3',
       sprintId: '4',
     });
-    expect(ref).toEqual({ id: '77', status: 'NOT STARTED', nextRunAt: '2026-01-05T09:00:00.000Z' });
+    expect(ref).toEqual({ id: '77', name: 'TC-55 schedule', status: 'NOT STARTED', nextRunAt: '2026-01-05T09:00:00.000Z' });
     expect(byPath(calls, 'POST', '/sh/scheduler')[0]!.body).toEqual({
       projectId: 7,
       name: 'TC-55 schedule',
@@ -692,7 +692,7 @@ test('createSchedule writes the scheduler form body for a TC and a suite, and re
     });
     expect(await adapter.createSchedule({ suiteId: 'SU_300' }, {
       scheduleType: 'once', scheduledFor: '2026-01-05T09:00:00.000Z', mode: 'cloud',
-    })).toEqual({ id: '78' });
+    })).toEqual({ id: '78', name: 'SU-300 schedule' });
     const body = byPath(calls, 'POST', '/sh/scheduler')[0]!.body;
     expect(body.schedulerType).toBe('SU');
     expect(body.parentId).toBe(300);

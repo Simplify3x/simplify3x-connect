@@ -1,6 +1,8 @@
 import express, { type Express } from 'express';
 import { mountQaMcp, type MountedStatus, type MountOptions } from './mount.js';
 import { log } from './log.js';
+import { resolveHost, resolveRequireClientToken } from './defaults.js';
+import { isLoopbackHost } from './tools/outDir.js';
 
 export type Gateway = {
   app: Express;
@@ -37,7 +39,7 @@ export type Gateway = {
 export function createGatewayApp(env: NodeJS.ProcessEnv = process.env, mountOptions: MountOptions = {}): Gateway {
   const app = express();
   const gatewayToken = (env['QA_MCP_GATEWAY_TOKEN'] ?? '').trim();
-  const clientTokenRequired = (env['QA_MCP_REQUIRE_CLIENT_TOKEN'] ?? '').toLowerCase() === 'true';
+  const clientTokenRequired = resolveRequireClientToken(env);
 
   if (gatewayToken || clientTokenRequired) {
     app.use('/mcp', (req, res, next) => {
@@ -65,7 +67,8 @@ export function createGatewayApp(env: NodeJS.ProcessEnv = process.env, mountOpti
     });
   }
 
-  const status = mountQaMcp(app, mountOptions);
+  // A gateway other machines can reach never lets a caller pick where files are written.
+  const status = mountQaMcp(app, { ...mountOptions, allowOutDir: mountOptions.allowOutDir ?? isLoopbackHost(resolveHost(env)) });
 
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) });
@@ -83,5 +86,13 @@ export function announce(host: string, port: number, gateway: Gateway): void {
   log(`simplify3x-connect gateway ready on http://${host}:${port}/mcp`);
   log(`health: http://${host}:${port}/health  ready: http://${host}:${port}/ready`);
   if (gateway.gatewayAuth) log('gateway token required on /mcp');
-  if (gateway.clientTokenRequired) log('per-user mode: every request must carry its own product token');
+  if (gateway.clientTokenRequired) {
+    log('per-user mode: every request must carry its own product token');
+    if ((process.env['QA_MCP_TOKEN'] ?? '').trim()) {
+      log('WARNING: QA_MCP_TOKEN is set but ignored in per-user mode; remove it from this deployment');
+    }
+    if ((process.env['QA_MCP_USER_ID'] ?? '').trim()) {
+      log('WARNING: QA_MCP_USER_ID is set but ignored in per-user mode; each user is identified from their own key');
+    }
+  }
 }

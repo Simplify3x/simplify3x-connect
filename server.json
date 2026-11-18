@@ -4,20 +4,45 @@
   "title": "simplify3x-connect",
   "description": "SimplifyQA test management: find, author, record, run and triage test cases.",
   "websiteUrl": "https://simplifyqa.ai",
-  "repository": { "url": "https://github.com/Simplify3x/simplify3x-connect", "source": "github" },
-  "version": "0.28.1",
+  "repository": {
+    "url": "https://github.com/Simplify3x/simplify3x-connect",
+    "source": "github"
+  },
+  "version": "0.31.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "simplify3x-connect",
-      "version": "0.28.1",
-      "transport": { "type": "stdio" },
+      "version": "0.31.0",
+      "transport": {
+        "type": "stdio"
+      },
       "environmentVariables": [
-        { "name": "QA_MCP_PROVIDER", "description": "Product: simplifyqa or walnut", "default": "simplifyqa", "isRequired": true },
-        { "name": "QA_BASE_URL", "description": "Your SimplifyQA URL", "isRequired": true },
-        { "name": "QA_MCP_TOKEN", "description": "SimplifyQA API token", "isRequired": true, "isSecret": true },
-        { "name": "QA_MCP_PROJECT_ID", "description": "Default project ID" },
-        { "name": "QA_MCP_URL", "description": "Local recording agent URL (recording only)" }
+        {
+          "name": "QA_MCP_PROVIDER",
+          "description": "Product: simplifyqa or walnut",
+          "default": "simplifyqa",
+          "isRequired": true
+        },
+        {
+          "name": "QA_BASE_URL",
+          "description": "Your SimplifyQA URL",
+          "isRequired": true
+        },
+        {
+          "name": "QA_MCP_TOKEN",
+          "description": "SimplifyQA API token",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "QA_MCP_PROJECT_ID",
+          "description": "Default project ID"
+        },
+        {
+          "name": "QA_MCP_URL",
+          "description": "Local recording agent URL (recording only)"
+        }
       ]
     }
   ]

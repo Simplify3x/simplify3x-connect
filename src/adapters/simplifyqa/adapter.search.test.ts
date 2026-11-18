@@ -440,3 +440,72 @@ test('users + a project the caller is not in is refused instead of silently retu
   // Only the admin probe ran — the member search never happened.
   expect(searchCalls(calls, '/pm/users/search')).toHaveLength(1);
 });
+
+describe('executions list parent runs only (as Reports v2 does)', () => {
+  const PARENT_ONLY = { column: 'childExecution', value: true, operator: 'nor' };
+  const NO_COPIES = { column: 'parentExecutionCopy', value: true, operator: 'nor' };
+  const fieldsOf = async (where: any[]) => {
+    const { adapter } = makeAdapter();
+    const out = (await adapter.sqaQuery({ op: 'search', collection: 'executions', where, dryRun: true })) as any;
+    return out.payload.searchFields as any[];
+  };
+
+  test('a plain search hides child runs and parent copies', async () => {
+    const fields = await fieldsOf([{ field: 'executionTypeId', op: 'eq', value: 100 }]);
+    expect(fields).toContainEqual(PARENT_ONLY);
+    expect(fields).toContainEqual(NO_COPIES);
+  });
+
+  test('count applies the same default', async () => {
+    const { adapter, calls } = makeAdapter((url) =>
+      url.endsWith('/exec/execution/search') ? { body: JSON.stringify({ totalCount: 2, data: [] }) } : undefined);
+    await adapter.sqaQuery({ op: 'count', collection: 'executions', where: [{ field: 'executionTypeId', op: 'eq', value: 100 }] });
+    const body = searchCalls(calls, '/exec/execution/search')[0]!.body;
+    expect(body.searchFields).toContainEqual(PARENT_ONLY);
+    expect(body.searchFields).toContainEqual(NO_COPIES);
+  });
+
+  test('naming childExecution or parentExecutionId asks for child runs', async () => {
+    for (const where of [
+      [{ field: 'childExecution', op: 'eq', value: true }],
+      [{ field: 'parentExecutionId', op: 'eq', value: 53133 }],
+    ]) {
+      const fields = await fieldsOf(where);
+      expect(fields).not.toContainEqual(PARENT_ONLY);
+      expect(fields).toContainEqual(NO_COPIES);
+    }
+  });
+
+  test('a lookup by id or code finds the row whatever it is', async () => {
+    for (const where of [[{ field: 'id', op: 'eq', value: 53134 }], [{ field: 'code', op: 'eq', value: 'EX-53134' }]]) {
+      const fields = await fieldsOf(where);
+      expect(fields).not.toContainEqual(PARENT_ONLY);
+      expect(fields).not.toContainEqual(NO_COPIES);
+    }
+  });
+
+  test('naming parentExecutionCopy asks for the copies', async () => {
+    const fields = await fieldsOf([{ field: 'parentExecutionCopy', op: 'eq', value: true }]);
+    expect(fields).not.toContainEqual(NO_COPIES);
+    expect(fields).toContainEqual({ column: 'parentExecutionCopy', value: true });
+  });
+
+  test('includeHidden returns every row', async () => {
+    const { adapter } = makeAdapter();
+    const out = (await adapter.sqaQuery({ op: 'search', collection: 'executions', includeHidden: true, dryRun: true })) as any;
+    expect(out.payload.searchFields).not.toContainEqual(PARENT_ONLY);
+    expect(out.payload.searchFields).not.toContainEqual(NO_COPIES);
+  });
+
+  test('relation "children" lists the child runs of a parent', async () => {
+    const { adapter, calls } = makeAdapter((url) =>
+      url.endsWith('/exec/execution/search')
+        ? { body: JSON.stringify({ totalCount: 1, data: [{ id: 53133, code: 'EX-53133', childExecutions: [53134] }] }) }
+        : undefined);
+    await adapter.sqaQuery({ op: 'related', collection: 'executions', id: 'EX-53133', relation: 'children' });
+    const bodies = searchCalls(calls, '/exec/execution/search').map((c) => c.body.searchFields as any[]);
+    const childQuery = bodies[bodies.length - 1]!;
+    expect(childQuery).toContainEqual({ column: 'parentExecutionId', value: 53133 });
+    expect(childQuery).not.toContainEqual(PARENT_ONLY);
+  });
+});

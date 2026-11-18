@@ -1,9 +1,10 @@
-import { join } from 'node:path';
+import { resolveOutDir } from './outDir.js';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
 import type { ReportKind } from '../domain/types.js';
+import { resolveHosted } from '../defaults.js';
 
 /**
  * `report_download` — generate the same PDF reports the SimplifyQA UI offers, for a test case or a
@@ -12,6 +13,8 @@ import type { ReportKind } from '../domain/types.js';
  */
 export type ReportToolsDeps = {
   getAdapter: () => ProviderAdapter | null;
+  /** False on a server other machines can reach: a caller `outDir` is then ignored (tools/outDir.ts). Default true. */
+  allowOutDir?: boolean;
 };
 
 const NOT_CONNECTED =
@@ -39,7 +42,11 @@ export function registerReportTools(server: McpServer, deps: ReportToolsDeps): v
         'The report is for ONE execution: by default the most recent one, and the response states which ' +
         'execution was used and how many others exist — pass `runId` (execution id) to pick another. Files are ' +
         'saved under `outDir` (default ./qa-reports) and their paths returned. Protected parameters are masked ' +
-        'by the report service. Requires a live connection; no agent needed.',
+        'by the report service. Requires a live connection; no agent needed.' +
+        (resolveHosted()
+          ? ' ON THIS SHARED SERVER nothing is saved: the tool returns the execution\'s SimplifyQA report page, ' +
+            'where the user downloads the PDFs with their own login. Give the user that link.'
+          : ''),
       inputSchema: {
         target: z.enum(['testcase', 'suite']).describe('Report for a test case or a suite.'),
         ref: z.string().min(1).describe('Test case id/key (TC_123), or suite name / id.'),
@@ -93,7 +100,17 @@ export function registerReportTools(server: McpServer, deps: ReportToolsDeps): v
           how = ` Used execution EX-${execId} as requested.`;
         }
 
-        const dir = outDir ?? join(process.cwd(), 'qa-reports');
+        if (resolveHosted()) {
+          // Users cannot reach a shared server's disk, so hand them the product's own report page.
+          const run = await adapter.getRun(execId);
+          if (!run.reportUrl) return err(`No report page is available for execution EX-${execId}.${how}`);
+          return ok(
+            `Open the SimplifyQA report page for ${target} **${ref}** and download the ${kinds.join(', ')} ` +
+              `report${kinds.length === 1 ? '' : 's'} there:\n${run.reportUrl}${how}`,
+            { reportUrl: run.reportUrl, execution: execId, reportTypes: kinds },
+          );
+        }
+        const { dir, note: outDirNote } = resolveOutDir(outDir, deps.allowOutDir !== false);
         const res = await adapter.downloadReports({ runId: execId, kinds, outDir: dir });
         if (!res.files.length) {
           return err(`No report files were produced for ${ref}.${res.notes.length ? '\n' + res.notes.join('\n') : ''}`);
@@ -101,7 +118,8 @@ export function registerReportTools(server: McpServer, deps: ReportToolsDeps): v
         const lines = res.files.map((f) => `- ${f.label} — \`${f.path}\` (${(f.bytes / 1024).toFixed(0)} KB)`).join('\n');
         return ok(
           `Generated ${res.files.length} PDF report${res.files.length === 1 ? '' : 's'} for ${res.scope} **${ref}** (${res.runLabel}).${how}\n\n${lines}` +
-            (res.notes.length ? `\n\nNotes:\n${res.notes.map((n) => `- ${n}`).join('\n')}` : ''),
+            (res.notes.length ? `\n\nNotes:\n${res.notes.map((n) => `- ${n}`).join('\n')}` : '') +
+            (outDirNote ? `\n\n${outDirNote}` : ''),
           { files: res.files, execution: execId, notes: res.notes },
         );
       } catch (e) {

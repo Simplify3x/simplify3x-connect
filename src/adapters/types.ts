@@ -280,7 +280,12 @@ export interface ProviderAdapter {
   editJournal?(tcId: string, ops: JournalOp[]): Promise<JournalView>;
 
   listSuites(): Promise<SuiteSummary[]>;
-  getSuite(id: string): Promise<Suite>;
+  /** SimplifyQA-only: create an ENVIRONMENT (project configuration > Environments). Absent elsewhere. */
+  createEnvironment?(input: { name: string; key?: string }): Promise<{ id: string; key: string; name: string }>;
+  /** SimplifyQA-only: rename / re-key an existing environment (name or key). */
+  updateEnvironment?(ref: string, patch: { name?: string; key?: string }): Promise<{ id: string; key: string; name: string }>;
+  /** SimplifyQA-only: delete an environment (the UI's delete; General is refused). */
+  deleteEnvironment?(ref: string): Promise<{ id: string; name: string; key: string }>;  getSuite(id: string): Promise<Suite>;
   createSuite(s: Suite): Promise<SavedRef>;
   /** SimplifyQA-only: create a PROJECT (admin surface). */
   createProject?(input: { name: string; description?: string | undefined; users?: number[] | undefined }): Promise<SavedRef>;
