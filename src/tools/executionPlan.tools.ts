@@ -10,6 +10,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
+import { autoDefectLogRefusal } from './autoDefectLog.js';
 import type { ExecutionPlanInput, PlanEntryInput, PlanEntryRef, PlanRunRef, SuiteRef } from '../adapters/simplifyqa/adapter.js';
 
 export type ExecutionPlanToolDeps = { getAdapter: () => ProviderAdapter | null };
@@ -58,7 +59,10 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
         '- action:"create" — needs `name`, `plannedStartDate`, `plannedEndDate` (YYYY-MM-DD) and `environment` ' +
         '(name or key; see sqa_query collection "environments"). Optional: releaseId, sprintId, teamIds, planners, ' +
         'autoReExecCount, autoReExecTriggerOn, autoDefectLog, newBrowserSession, terminateOnFailure.\n' +
-        '- action:"update" — needs `planId` and at least one field to change (same fields as create).\n' +
+        '- action:"update" — needs `planId` and at least one field to change (same fields as create). AUTO DEFECT LOGGING for ' +
+        'the plan = `autoDefectLog:true` (create or update): failed steps then log a defect automatically. It needs the project\'s ' +
+        'admin "Auto Defect Logging" switch on; if it is off the call is refused with that instruction — tell the user to ask ' +
+        'an admin to enable it, then retry.\n' +
         '- action:"delete" — needs `planId`. TWO-STEP: call without `confirm` to PREVIEW (nothing is deleted; it ' +
         'states what is permanently lost), show it to the user, and call again with `confirm:true` ONLY after the user ' +
         'explicitly says to delete.\n' +
@@ -97,7 +101,7 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
         planners: z.array(z.number()).optional().describe('create/update: planner user ids.'),
         autoReExecCount: z.number().int().min(0).optional().describe('create/update.'),
         autoReExecTriggerOn: z.string().optional().describe('create/update.'),
-        autoDefectLog: z.boolean().optional().describe('create/update.'),
+        autoDefectLog: z.boolean().optional().describe('create/update: log a defect automatically when a step fails (needs the project\'s admin Auto Defect Logging switch on).'),
         newBrowserSession: z.boolean().optional().describe('create/update.'),
         terminateOnFailure: z.boolean().optional().describe('create/update.'),
         confirm: z.boolean().optional().describe('delete: true on the SECOND call, only after the user explicitly said to delete.'),
@@ -125,6 +129,10 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
         else (fields as Record<string, unknown>)[k] = v;
       }
       try {
+        if ((action === 'create' || action === 'update') && args.autoDefectLog === true) {
+          const refusal = await autoDefectLogRefusal(adapter, 'execution plan');
+          if (refusal) return err(refusal);
+        }
         if (action === 'create') {
           const missing = (['name', 'plannedStartDate', 'plannedEndDate', 'environment'] as const).filter((k) => !args[k]);
           if (missing.length) return err(`execution_plan action:"create" needs: ${missing.join(', ')}.`);

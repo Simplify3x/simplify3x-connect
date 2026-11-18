@@ -1,7 +1,7 @@
 {
   "name": "simplify3x-connect",
   "displayName": "Simplify3x Connect",
-  "version": "0.31.1",
+  "version": "0.31.2",
   "description": "Find, write, record, run and triage SimplifyQA test cases, suites, executions and defects from Claude",
   "author": {
     "name": "Simplify3x",
@@ -28,7 +28,7 @@
       "command": "npx",
       "args": [
         "-y",
-        "simplify3x-connect@0.31.1"
+        "simplify3x-connect@0.31.2"
       ],
       "env": {
         "QA_MCP_PROVIDER": "simplifyqa",

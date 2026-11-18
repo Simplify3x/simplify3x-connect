@@ -10,6 +10,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
+import { autoDefectLogNote, autoDefectLogRefusal } from './autoDefectLog.js';
 import type { SuiteBlockers, SuiteRef, SuiteSettings, SuiteSettingsView } from '../adapters/simplifyqa/adapter.js';
 
 export type SuiteManageDeps = { getAdapter: () => ProviderAdapter | null };
@@ -60,6 +61,9 @@ export function registerSuiteManageTools(server: McpServer, deps: SuiteManageDep
         'Stack canvas behind Execution Type → Stack): N stacks with the suite\'s test cases spread across ' +
         'them round-robin (every stack needs at least one). `stackMode` "cloud" (default) or "local"; ' +
         '`browser` for WEB cases. Then run it with suite_run mode:"stack".\n' +
+        'AUTO DEFECT LOGGING for the suite = action:"update" with settings:{ autoDefectLog:true } (failed steps then log ' +
+        'a defect automatically). It needs the project\'s admin "Auto Defect Logging" switch on; if it is off the call is ' +
+        'refused with that instruction — tell the user to ask an admin to enable it, then retry.\n' +
         'Add/remove member test cases with suite_add_testcases / suite_remove_testcases; create with suite_create.',
       inputSchema: {
         action: z.enum(['get', 'update', 'delete', 'stack_setup']).describe('What to do with the suite.'),
@@ -110,6 +114,7 @@ export function registerSuiteManageTools(server: McpServer, deps: SuiteManageDep
         if (action === 'get') {
           if (!suiteId) return err('suite_manage action:"get" needs suiteId.');
           const view = await adapter.getSuiteSettings(suiteId);
+          const adminNote = await autoDefectLogNote(adapter, view.autoDefectLog);
           return ok(
             `Suite ${view.code ?? view.name ?? view.id} settings:\n` +
               `- execution type: ${view.executionType ?? '(unset)'}\n` +
@@ -118,7 +123,8 @@ export function registerSuiteManageTools(server: McpServer, deps: SuiteManageDep
               `- auto defect log: ${view.autoDefectLog ? 'on' : 'off'}\n` +
               `- new browser session: ${view.newBrowserSession ? 'on' : 'off'}\n` +
               `- terminate on failure: ${view.terminateOnFailure ? 'on' : 'off'}\n` +
-              `- container limits: min ${view.minimumContainerCount ?? '-'} / max ${view.maximumContainerCount ?? '-'}`,
+              `- container limits: min ${view.minimumContainerCount ?? '-'} / max ${view.maximumContainerCount ?? '-'}` +
+              (adminNote ? `\n${adminNote}` : ''),
             view as unknown as Record<string, unknown>,
           );
         }
@@ -131,6 +137,10 @@ export function registerSuiteManageTools(server: McpServer, deps: SuiteManageDep
           const hasSettings = !!settings && Object.values(settings).some((v) => v !== undefined);
           if (!suiteId || (!Object.keys(fields).length && !hasSettings)) {
             return err('suite_manage action:"update" needs: suiteId and at least one of name, description, executionType, settings.');
+          }
+          if (settings?.autoDefectLog === true) {
+            const refusal = await autoDefectLogRefusal(adapter, 'suite');
+            if (refusal) return err(refusal);
           }
           if (Object.keys(fields).length) await adapter.updateSuite(suiteId, fields);
           if (hasSettings) await adapter.updateSuiteSettings(suiteId, settings as SuiteSettings);

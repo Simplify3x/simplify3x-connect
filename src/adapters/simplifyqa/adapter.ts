@@ -4443,6 +4443,21 @@ export class SimplifyQaAdapter {
     return (doc?.data && typeof doc.data === 'object' && !Array.isArray(doc.data) ? doc.data : doc) ?? {};
   }
 
+  /** The ADMIN-level Auto Defect Logging switch of the connected project (Project settings → Defect
+   *  management → `generalSettings.defectManagement.autoDefectFlag`). The backend logs a defect for a
+   *  failed step only when this is on AND the suite / execution plan has autoDefectLog set — the UI
+   *  refuses the suite/plan toggle while it is off. `undefined` = could not be read (no access): callers
+   *  must then not block. */
+  async autoDefectLogStatus(): Promise<{ adminEnabled: boolean } | undefined> {
+    try {
+      const project = await this.getProjectById(String(this.requireProjectId()));
+      const flag = project?.['generalSettings']?.['defectManagement']?.['autoDefectFlag'];
+      return { adminEnabled: flag === true };
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Soft-delete a project — the admin Project screen's delete (`PATCH /pm/project { ids }`). */
   async deleteProject(id: string): Promise<{ deleted: boolean }> {
     const numeric = Number.parseInt(numericId(id), 10);
@@ -10167,13 +10182,18 @@ export class SimplifyQaAdapter {
     const agentId = mode === 'LOCAL' ? await this.resolveLocalAgentId(opts.agentId)
                   : mode === 'REMOTE' ? await this.resolveRemoteAgentId(opts.agentId)
                   : null;
-    // Multi-device parallel: when opts.devices has >1 entry, build one executionItem per device
-    // under a SINGLE execution with executionStyle PARALLEL — matching the UI's multi-device flow.
+    // Multi-device parallel: when opts.devices has >1 entry, build ONE executionItem whose
+    // platform[] array contains ALL devices. The agent's ServerToAgentAdapter checks
+    // executionItems[0].platforms.size() — only when >1 does it create MultiTestCaseMetaData
+    // and MultiTestCaseExecutor.executeInParallel(). One-item-per-device would leave each
+    // item with platforms.size()==1, falling through to single-device serial mode.
     const isMultiDevice = opts.devices && opts.devices.length > 1;
 
     let executionItems: Array<Record<string, unknown>>;
     if (isMultiDevice) {
-      executionItems = opts.devices!.map((dev, idx) => {
+      // Collect all device platforms into a single array for the ONE executionItem
+      const allPlatforms: Array<Record<string, unknown>> = [];
+      for (const dev of opts.devices!) {
         const devPlatform = this.buildRunPlatform(tcType, mode, {
           deviceId: dev.deviceId,
           ...(dev.deviceName ? { deviceName: dev.deviceName } : {}),
@@ -10181,32 +10201,33 @@ export class SimplifyQaAdapter {
           ...(dev.osVersion ? { osVersion: dev.osVersion } : {}),
           ...(dev.cloudDeviceType ? { cloudDeviceType: dev.cloudDeviceType } : {}),
         });
-        const devStepId = Math.random().toString(36).slice(2, 8).padEnd(6, '0');
-        return {
-          id: tcNum,
-          name,
-          description,
-          versionId,
-          versionName,
-          seq: idx + 1,
-          stepId: devStepId,
-          stepCount: 0,
-          technologyType: tcType,
-          type: 'TC',
-          platform: devPlatform,
-          projectId,
-          projectName,
-          configuration: {},
-          iterationsSelected: [],
-          moduleId: moduleIdNum,
-          userstoryId: userstoryIdNum,
-          tags,
-          code,
-          prerequisite,
-          moduleName,
-          userstoryName: '',
-        };
-      });
+        allPlatforms.push(...devPlatform);
+      }
+      const stepId = Math.random().toString(36).slice(2, 8).padEnd(6, '0');
+      executionItems = [{
+        id: tcNum,
+        name,
+        description,
+        versionId,
+        versionName,
+        seq: 1,
+        stepId,
+        stepCount: 0,
+        technologyType: tcType,
+        type: 'TC',
+        platform: allPlatforms,
+        projectId,
+        projectName,
+        configuration: {},
+        iterationsSelected: [],
+        moduleId: moduleIdNum,
+        userstoryId: userstoryIdNum,
+        tags,
+        code,
+        prerequisite,
+        moduleName,
+        userstoryName: '',
+      }];
     } else {
       const platform = this.buildRunPlatform(tcType, mode, {
         ...(opts.browser !== undefined ? { browser: opts.browser } : {}),
