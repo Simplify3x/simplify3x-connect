@@ -7560,6 +7560,134 @@ export class SimplifyQaAdapter {
     return hit.key;
   }
 
+  /** The suite's saved STACK canvas (`/tm/executionFlow/SU/<id>/STACK`) or null. */
+  async getSuiteStacks(suiteId: string): Promise<Record<string, any> | null> {
+    const suite = await this.readOwnSuite(suiteId);
+    const raw = await this.http
+      .getJson<any>(`/tm/executionFlow/SU/${suite['id']}/STACK`)
+      .catch(() => undefined);
+    const doc = raw?.data ?? raw;
+    return doc && typeof doc === 'object' && doc.id !== undefined ? doc : null;
+  }
+
+  /** Configure the suite's STACK canvas with N stacks and spread its test cases across them — the same
+   *  document the suite's Stack canvas saves (`POST/PUT /tm/executionFlow`, parentType 'SU', flowType
+   *  'STACK'). Round-robin; the backend divides the saved stacks at run time. */
+  async configureSuiteStacks(suiteId: string, opts: { count: number; mode?: 'CLOUD' | 'LOCAL'; browser?: string }): Promise<{
+    created: boolean;
+    cloudAvailable?: boolean;
+    stacks: Array<{ id: string; name: string; mode: string; codes: string[] }>;
+  }> {
+    const count = Math.trunc(opts.count);
+    if (!Number.isFinite(count) || count < 1) throw new Error('stacks must be at least 1.');
+    const suite = await this.readOwnSuite(suiteId);
+    const label = String(suite['code'] ?? `SU-${suite['id']}`);
+    if (String(suite['suiteType'] ?? 'AUTOMATION').toUpperCase() === 'MANUAL') {
+      throw new Error(`${label} is a manual suite — Stack execution is for automation suites.`);
+    }
+    const projectId = this.requireProjectId();
+    const mode = (opts.mode ?? 'CLOUD').toUpperCase() as 'CLOUD' | 'LOCAL';
+
+    const rows = (Array.isArray(suite['testCases']) ? suite['testCases'] : []).filter((r: any) => r?.deleted !== true && r?.stepId);
+    if (!rows.length) throw new Error(`${label} has no saved test cases to distribute.`);
+    const browserKey = (opts.browser ?? 'chrome').toLowerCase();
+    const browser = { name: browserKey.charAt(0).toUpperCase() + browserKey.slice(1), key: browserKey, type: 'NONE' };
+    const existing = await this.getSuiteStacks(suiteId);
+    const stackDefs: any[] = Array.from({ length: count }, (_, i) => ({
+      id: randomUUID(), name: `Stack ${i + 1}`, position: null,
+      mode, agentId: null,
+      executionPlatform: { LOCAL: {}, REMOTE: {}, CLOUD: mode === 'CLOUD' ? { browser } : {} },
+      items: [] as any[],
+    }));
+    let i = 0;
+    for (const row of rows) {
+      const rawTc = await this.fetchRawTestcase(String(row.testcaseId)).catch(() => undefined);
+      if (!rawTc || !Object.keys(rawTc).length) continue;
+      const tech = String(str(rawTc, 'tcType') ?? 'WEB').toUpperCase();
+      const versions: any[] = Array.isArray(rawTc?.versions) ? rawTc.versions : [];
+      const ver = versions.find((v: any) => str(v, 'id', '_id') === String(row.versionId));
+      const p = row?.executionPlatform?.[mode] ?? {};
+      const platform = PLAN_SPECIAL_TECH.includes(tech)
+        ? [{ name: tech, id: tech, technologyType: tech, type: 'NONE' }]
+        : tech === 'WEB'
+          ? [{ name: browser.name, id: browser.key, technologyType: 'WEB', type: 'NONE' }]
+          : [{ name: p.name, id: p.id, technologyType: p.technologyType ?? tech, type: p.type ?? 'NONE',
+              ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) }];
+      stackDefs[i % count].items.push({
+        id: Number(rawTc.id ?? row.testcaseId), versionId: row.versionId, stepId: row.stepId, type: 'TC',
+        technologyType: tech, name: str(rawTc, 'name', 'title') ?? '', description: '', versionName: str(ver, 'name') ?? '',
+        seq: row.seq ?? i + 1, stepCount: -1, code: str(rawTc, 'code') ?? '', prerequisite: '',
+        projectId, projectName: '', moduleId: rawTc.moduleId ?? null, moduleName: '',
+        userstoryId: rawTc.userstoryId ?? null, userstoryName: '',
+        sourceType: null, sourceId: null, assignTo: null, assignDate: null, assigneeName: '',
+        createdByName: '', createdBy: null,
+        executionType: 'AUTOMATION', status: 'NOTEXECUTED', executionId: null, executionOS: null,
+        iterationsSelected: [], platform,
+      });
+      i++;
+    }
+    if (!i) throw new Error(`None of ${label}'s test cases could be read, so there is nothing to distribute.`);
+    if (count > i) throw new Error(`${label} has ${i} test case(s) — it cannot fill ${count} stacks (every stack needs at least one).`);
+
+    const payload: Record<string, unknown> = {
+      ...(existing?.['id'] ? { id: existing['id'] } : {}),
+      parentId: Number(suite['id']), parentType: 'SU', flowType: 'STACK', projectId,
+      viewMode: false, stacks: stackDefs,
+      connections: [], canvasConfig: { startNodePosition: { x: 0, y: 0 } },
+    };
+    if (existing?.['id']) await this.http.putJson<any>('/tm/executionFlow', payload);
+    else await this.http.postJson<any>('/tm/executionFlow', payload);
+
+    const after = await this.getSuiteStacks(suiteId);
+    const saved: any[] = Array.isArray(after?.['stacks']) ? after['stacks'] : [];
+    if (saved.length !== count) throw new Error(`Saved ${count} stack(s) but ${label}'s STACK drawing reads back ${saved.length}.`);
+    const cloudAvailable = mode === 'CLOUD' ? (await this.listCloudRunners().catch(() => [])).some((r) => r.online) : undefined;
+    return {
+      created: !existing,
+      ...(cloudAvailable !== undefined ? { cloudAvailable } : {}),
+      stacks: saved.map((s: any, n: number) => ({
+        id: String(s.id ?? ''), name: String(s.name ?? `Stack ${n + 1}`), mode: String(s.mode ?? mode),
+        codes: (Array.isArray(s.items) ? s.items : []).map((it: any) => String(it.code ?? `TC-${it.id}`)),
+      })),
+    };
+  }
+
+  /** What a suite STACK run needs, checked before anything is created: a saved canvas with no empty stack,
+   *  a cloud machine only when a stack is CLOUD, and this machine's agent only when a stack is LOCAL. */
+  private async suiteStackRunPlan(rawSuite: Record<string, any>, opts: RunOptions): Promise<{ agentId: string | null; cloudType: string }> {
+    const label = String(rawSuite['code'] ?? `SU-${rawSuite['id']}`);
+    if (String(rawSuite['suiteType'] ?? 'AUTOMATION').toUpperCase() === 'MANUAL') {
+      throw new Error(`${label} is a manual suite — Stack execution is for automation suites.`);
+    }
+    const flow = await this.getSuiteStacks(String(rawSuite['id']));
+    const stacks: any[] = Array.isArray(flow?.['stacks']) ? flow!['stacks'] : [];
+    if (!stacks.length) throw new Error(`${label} has no saved stack setup — configure it first (suite_manage action:"stack_setup").`);
+    const empty = stacks.filter((s) => !(Array.isArray(s?.items) && s.items.length));
+    if (empty.length) throw new Error(`Every stack needs at least one test case — empty: ${empty.map((s) => s?.name ?? s?.id).join(', ')}.`);
+    let cloudType = 'NONE';
+    const cloudStacks = stacks.filter((s) => String(s?.mode).toUpperCase() === 'CLOUD');
+    if (cloudStacks.length) {
+      const online = (await this.listCloudRunners().catch(() => [])).filter((r) => r.online);
+      if (!online.length) {
+        throw new Error(
+          `${label} has CLOUD stack(s) (${cloudStacks.map((s) => s?.name ?? s?.id).join(', ')}) but this project has no cloud machine configured. ` +
+            'Add/assign a cloud machine in the project settings, or re-run stack_setup with stackMode:"local".',
+        );
+      }
+      cloudType = online[0]?.cloudType ?? 'VM';
+    }
+    let agentId: string | null = null;
+    if (stacks.some((s) => (String(s?.mode ?? 'LOCAL')).toUpperCase() === 'LOCAL')) {
+      const probe = await this.probeLocalAgentDetailed();
+      if (!probe.up) {
+        throw new Error(`Can't run ${label} with local stacks: the SimplifyQA desktop agent at ${probe.url ?? '(no URL)'} is not reachable` +
+          `${probe.reason ? ` (${probe.reason})` : ''}. Start it, then try again.`);
+      }
+      agentId = await this.resolveLocalAgentId(opts.agentId);
+    }
+    return { agentId, cloudType };
+  }
+
   /** A live suite of the ACTIVE project, or a clear refusal — checked before every suite write. */
   private async readOwnSuite(id: string): Promise<Record<string, any>> {
     const raw = await this.fetchRawSuite(id);
@@ -10256,7 +10384,10 @@ export class SimplifyQaAdapter {
     // and breaks the agent's iteration join. Missing platform for a row is not an error here (UI
     // sends `[]`) — the agent tolerates it for MANUAL suites; AUTOMATION suites without a saved
     // platform were misconfigured upstream and would fail regardless.
-    const members: any[] = Array.isArray(rawSuite.testCases) ? rawSuite.testCases : [];
+    // STACK: the backend runs the SAVED stack canvas, so the run carries no items (the UI's Execute dialog
+    // sends `executionItems: []`, SERIAL, the live local agent and the project's cloud type).
+    const stackRun = mode === 'STACK' ? await this.suiteStackRunPlan(rawSuite, opts) : undefined;
+    const members: any[] = !stackRun && Array.isArray(rawSuite.testCases) ? rawSuite.testCases : [];
     const executionItems: Array<Record<string, unknown>> = [];
     let seqCounter = 0;
     for (const row of members) {
@@ -10337,7 +10468,7 @@ export class SimplifyQaAdapter {
       });
     }
 
-    if (executionItems.length === 0) {
+    if (!stackRun && executionItems.length === 0) {
       throw new Error(
         `startRun: suite ${suiteId} has no runnable test cases (all members were deleted, ` +
         `unreadable, or filtered out).`,
@@ -10348,7 +10479,9 @@ export class SimplifyQaAdapter {
     // pin the suite doc's saved `agentId` (or null when the suite wasn't pinned). CLOUD_AGENT
     // fallback (:771-774) promotes `cloudType` to 'SQA'.
     let agentId: string | null;
-    if (mode === 'LOCAL') {
+    if (stackRun) {
+      agentId = stackRun.agentId;
+    } else if (mode === 'LOCAL') {
       agentId = await this.resolveLocalAgentId(opts.agentId);
     } else if (mode === 'REMOTE') {
       const preferred = opts.agentId ?? (typeof rawSuite.agentId === 'string' ? rawSuite.agentId : undefined);
@@ -10356,8 +10489,9 @@ export class SimplifyQaAdapter {
     } else {
       agentId = typeof rawSuite.agentId === 'string' && rawSuite.agentId.length > 0 ? rawSuite.agentId : null;
     }
-    let cloudType: 'NONE' | 'VM' | 'AZURE' | 'KUBERNETES' | 'SQA' = mode === 'CLOUD' ? normalizeCloudType(opts.cloudType) : 'NONE';
-    if (!agentId && typeof rawSuite.cloudAgentId === 'string' && rawSuite.cloudAgentId.length > 0) {
+    let cloudType: 'NONE' | 'VM' | 'AZURE' | 'KUBERNETES' | 'SQA' = mode === 'CLOUD' ? normalizeCloudType(opts.cloudType)
+      : stackRun && stackRun.cloudType !== 'NONE' ? normalizeCloudType(stackRun.cloudType) : 'NONE';
+    if (!stackRun && !agentId && typeof rawSuite.cloudAgentId === 'string' && rawSuite.cloudAgentId.length > 0) {
       agentId = rawSuite.cloudAgentId;
       cloudType = 'SQA';
     }
@@ -10365,7 +10499,7 @@ export class SimplifyQaAdapter {
     const body: Record<string, unknown> = {
       projectId,
       environmentType: env,
-      executionStyle: (opts.strategy ?? 'serial').toUpperCase(),
+      executionStyle: stackRun ? 'SERIAL' : (opts.strategy ?? 'serial').toUpperCase(),
       executionOS: this.detectExecutionOS(),
       executionTypeId: suiteNum,
       executionTypeName: str(rawSuite, 'name') ?? '',

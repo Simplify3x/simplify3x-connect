@@ -673,8 +673,9 @@ export type DeviceSpec = {
 export type RunOptions = { environment?: string; browser?: string; headless?: boolean;
   /** Where to run: 'local' = THIS machine's desktop agent; 'remote' = ANOTHER registered agent
    *  machine (a teammate's box, from remote_agents); 'cloud' = a cloud runner VM. The client MUST
-   *  decide this (asking the user when unstated) — there is no safe default. */
-  mode?: 'local' | 'remote' | 'cloud';
+   *  decide this (asking the user when unstated) — there is no safe default. 'stack' (suites only) runs
+   *  the suite's saved stack setup. */
+  mode?: 'local' | 'remote' | 'cloud' | 'stack';
   /** For mode:'local' — a specific local agent credential_id (from local_agents; must be THIS
    *  machine's row). Omit to auto-pick this machine's agent. For mode:'remote' — REQUIRED, a
    *  credential_id from remote_agents (a teammate's row; auto-pick is not safe across boxes). */

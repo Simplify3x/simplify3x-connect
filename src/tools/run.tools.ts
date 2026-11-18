@@ -28,7 +28,7 @@ const NOT_CONNECTED =
  *  are inherently per-run. Cleared on process exit; not persisted. */
 type LastRunConfig = {
   when?: 'immediate' | 'schedule' | undefined;
-  mode?: 'local' | 'remote' | 'cloud' | undefined;
+  mode?: 'local' | 'remote' | 'cloud' | 'stack' | undefined;
   releaseId?: string | undefined;
   sprintId?: string | undefined;
   environment?: string | undefined;
@@ -560,7 +560,7 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
       }
       if (reuseConfig === true && remembered) {
         if (when === undefined) when = remembered.when;
-        if (mode === undefined) mode = remembered.mode;
+        if (mode === undefined && remembered.mode !== 'stack') mode = remembered.mode;
         if (releaseId === undefined) releaseId = remembered.releaseId;
         if (sprintId === undefined) sprintId = remembered.sprintId;
         // `environment` is deliberately NOT merged: it selects which test-data set the run uses
@@ -906,7 +906,7 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
         suiteId: z.string().describe('The suite id to run (from suite_list / suite_get).'),
         reuseConfig: z.boolean().optional().describe("Set only when the tool refused asking about REUSE. true = merge the previous run's mode/release/sprint/browser/agent/runner into any unset field; the ENVIRONMENT is never merged — it is asked on every run; false = ignore prior config. Omit on a first run."),
         when: z.enum(['immediate', 'schedule']).optional().describe("STEP 1 — when to run. REQUIRED, ASK the user if unstated."),
-        mode: z.enum(['local', 'remote', 'cloud']).optional().describe('STEP 2 — where to run. REQUIRED, ASK the user if unstated.'),
+        mode: z.enum(['local', 'remote', 'cloud', 'stack']).optional().describe("STEP 2 — where to run. REQUIRED, ASK the user if unstated. 'stack' runs the suite's saved Stack setup (the UI's Execution Type → Stack): set it up first with suite_manage action:'stack_setup'; immediate runs only, serial per stack."),
         releaseId: z.string().optional().describe("STEP 4 — release from list_releases. ASK the user; pass '' to skip (no release / no sprint asked)."),
         sprintId: z.string().optional().describe("STEP 5 — sprint from list_sprints (scoped to release). Only asked when releaseId is non-empty; skipped when releaseId=''. Pass '' to skip."),
         environment: z.string().optional().describe('STEP 6 — environment key (from tc_list_environments). ASK the user on EVERY suite run; the UI marks this required for a suite. Never inherited from a previous run — reuseConfig does not fill it.'),
@@ -979,7 +979,7 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
       }
       // STEP 3 — serial vs parallel (the UI's PARALLEL/SERIAL radio). The wire defaults to SERIAL, so an
       // unasked strategy silently hides the faster option on every suite run.
-      if (when === 'immediate' && !strategy) {
+      if (when === 'immediate' && !strategy && mode !== 'stack') {
         return err(
           'ASK the user whether this suite should run SERIAL or PARALLEL — the PARALLEL/SERIAL radio the ' +
             "UI's Execute-suite dialog shows above Release (it applies to local, remote and cloud). RECOMMEND " +
@@ -1011,6 +1011,9 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
             'suite_run again with environment set to the chosen env key. Required — the UI marks this ' +
             'field with a red asterisk for a suite.',
         );
+      }
+      if (mode === 'stack' && when === 'schedule') {
+        return err("A Stack run can't be scheduled from here — it runs the suite's saved stack setup; use when:'immediate'.");
       }
 
       let resolvedRunner: CloudRunner | undefined;
@@ -1052,6 +1055,7 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
       }
 
       if (when === 'schedule') {
+        if (mode === 'stack') return err("A Stack run can't be scheduled from here; use when:'immediate'.");
         if (!adapter.createSchedule) return err('This product does not support scheduling runs.');
         const askSchedule = missingScheduleFields('suite_run', scheduledFor, scheduleType, endDate);
         if (askSchedule || !scheduledFor) {
@@ -1102,7 +1106,7 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
 
       const opts: RunOptions = {
         mode,
-        ...((mode === 'local' || mode === 'remote') && agentId ? { agentId } : {}),
+        ...((mode === 'local' || mode === 'remote' || mode === 'stack') && agentId ? { agentId } : {}),
         ...(environment !== undefined ? { environment } : {}),
         ...(browser !== undefined ? { browser } : {}),
         ...(headless !== undefined ? { headless } : {}),
@@ -1117,7 +1121,9 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
       try {
         const run = await adapter.startRun({ suiteId }, opts);
         const where =
-          mode === 'cloud'
+          mode === 'stack'
+            ? 'with its saved Stack setup'
+            : mode === 'cloud'
             ? `on cloud runner ${resolvedRunner ? `**${resolvedRunner.name}**` : ''}`
             : mode === 'remote'
               ? `on remote agent \`${agentId}\``
