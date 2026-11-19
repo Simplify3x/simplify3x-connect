@@ -457,6 +457,8 @@ export function toSuite(doc: any): Suite {
   const members = rawMembers.map((tc: any, i: number) => ({
     tcId: str(tc, 'testcaseId', 'id', '_id') ?? '',
     order: typeof tc?.seq === 'number' ? tc.seq : i + 1,
+    ...(str(tc, 'version') ? { version: str(tc, 'version')! } : {}),
+    ...(str(tc, 'versionId') ? { versionId: str(tc, 'versionId')! } : {}),
   }));
   return {
     ...(id ? { id } : {}),

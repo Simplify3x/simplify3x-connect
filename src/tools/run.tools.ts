@@ -3,6 +3,7 @@ import { log } from '../log.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
+import { autoDefectLogRunNote } from './autoDefectLog.js';
 import { SCHEDULE_TYPES, type CloudRunner, type LocalAgent, type MobileDevice, type RunOptions, type RunState, type RunStatus, type RunSummary, type ScheduleInfo, type ScheduleOptions, type ScheduleType, type ScheduleUpdate } from '../domain/types.js';
 
 /**
@@ -92,9 +93,20 @@ const SCHEDULE_TYPE_DESC =
   "SCHEDULE STEP — REQUIRED for when:'schedule'; ASK the user explicitly, never assume. The " +
   "UI's Recurrence choices: 'once', 'every_5_minutes', 'hourly', 'daily', 'weekly', 'monthly'. " +
   "Anything but 'once' also needs endDate. ('weekdays' = weekly Mon–Fri, MCP shortcut — don't offer it.) " +
-  "REPEAT EVERY N: hourly / daily / weekly / monthly take `interval` N (hourly + interval 2 = every 2 hours; default 1); weekly takes `daysOfWeek`; " +
-  "monthly takes `dayOfMonth` (1–30) OR `occurrence` (first/second/third/last) + one weekday in `daysOfWeek`. SimplifyQA has NO 'every N minutes' — " +
-  "only every_5_minutes (fixed).";
+  "REPEAT EVERY N: hourly / daily / weekly / monthly take `interval` N — 'every 3 hours' = hourly + interval 3, 'every 2 days' = daily + interval 2, " +
+  "'every 2 weeks' = weekly + interval 2 (default 1); weekly takes `daysOfWeek`; " +
+  "monthly takes `dayOfMonth` (1–30) OR `occurrence` (first/second/third/last) + one weekday in `daysOfWeek`. " +
+  "MINUTES: 'every N minutes' = 'every_5_minutes' + `interval` N (the product stores it as EVERY_5_MINUTES with that interval; without a number it is 5).";
+/** Which browsers a SCHEDULE takes. SimplifyQA's Scheduler offers Chrome, Edge, Firefox and Safari, so chrome IS allowed there;
+ *  only Walnut's scheduler is limited to the Playwright set. */
+const SCHEDULE_BROWSER_NOTE =
+  "For a SCHEDULE on SimplifyQA, 'chrome' (and 'chromium') = Chrome, 'msedge'/'edge' = Edge, 'firefox', 'webkit'/'safari' = Safari — chrome is fine; " +
+  "on Walnut a schedule accepts only chromium/msedge/firefox/webkit.";
+/** On the CLOUD the browser choice is the cloud picker's: Chrome / Firefox / Edge Headless, not the local list. */
+const CLOUD_BROWSER_NOTE =
+  "ON THE CLOUD (mode 'cloud') the ONLY choices are Chrome Headless, Firefox Headless and Edge Headless (pass 'chrome', 'firefox' or 'edge' — each means its headless one); " +
+  "never offer safari/webkit/chromium there. A suite or plan run in the cloud asks for it when a web test case has no saved cloud browser.";
+const SCHEDULE_BROWSER_DESC = 'New browser for a WEB test case / suite schedule. ' + SCHEDULE_BROWSER_NOTE;
 /** "every 2 hours" / "weekly on MONDAY, FRIDAY" / "monthly on the first MONDAY" — what a schedule repeats as, in words. */
 export function describeCadence(type: string | undefined, o: { interval?: number | undefined; daysOfWeek?: string[] | undefined; dayOfMonth?: number | undefined; occurrence?: string | undefined }): string {
   const t = type ?? 'once';
@@ -511,7 +523,7 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
         sprintId: z.string().optional().describe("STEP 4 — tag the run with a SPRINT (from list_sprints, scoped to release). Only asked when releaseId is non-empty; skipped entirely when releaseId=''. Pass '' after asking to skip."),
         versionId: z.string().optional().describe("STEP 5 — override the TC's currently-selected VERSION for this run (an id or name from the TC's `versions[]`). Pass '' to accept the TC's current version."),
         environment: z.string().optional().describe('STEP 6 — environment key (from tc_list_environments). ASK the user on EVERY run; the UI marks this required. Never inherited from a previous run — reuseConfig does not fill it.'),
-        browser: z.string().optional().describe("STEP 7 (WEB TCs) — browser, default 'chromium' (bundled + isolated). Others: 'chrome'/'msedge' (installed channel), 'firefox', 'webkit'. NOTE: a schedule accepts only chromium/msedge/firefox/webkit."),
+        browser: z.string().optional().describe("STEP 7 (WEB TCs) — browser, default 'chromium' (bundled + isolated). Others: 'chrome'/'msedge' (installed channel), 'firefox', 'webkit'. " + CLOUD_BROWSER_NOTE + ' ' + SCHEDULE_BROWSER_NOTE),
         deviceId: z.string().optional().describe("STEP 7 (ANDROID/IOS TCs) — the target device id. LOCAL: adb serial or emulator name. CLOUD: the marketplace device name. Enumerate with `mobile_list_devices`."),
         deviceName: z.string().optional().describe("STEP 7 (ANDROID/IOS TCs) — the human-readable device name (e.g. 'Oppo-Cph2375-Ab1fe936', 'Pixel 7'). Read off the matching row's `displayName` (preferred) or `name` field from `mobile_list_devices`. Shown in the execution report. Auto-resolved from the device roster if omitted."),
         deviceType: z.enum(['real_device', 'emulator', 'simulator', 'cloud_device', 'cloud_emulator', 'cloud_simulator']).optional().describe("STEP 7 (ANDROID/IOS TCs) — the KIND of device the picked `deviceId` is (read off the matching row from `mobile_list_devices`)."),
@@ -532,7 +544,7 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
         endDate: z.string().optional().describe(END_DATE_DESC),
         timezone: z.string().optional().describe("IANA timezone for a schedule (e.g. 'Asia/Kolkata'). Default 'UTC'."),
         scheduleName: z.string().min(3).max(501).optional().describe("when:'schedule' — the schedule's NAME as the Scheduler shows it (3–501 characters, unique in the project), e.g. 'nightly smoke'. Omit it and the schedule is named '<TC-22> schedule' (numbered when taken)."),
-        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1. Not for 'once' / 'every_5_minutes' (fixed at 5 minutes — SimplifyQA has no other minute interval)."),
+        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1. With 'every_5_minutes' it is the N in 'every N minutes'. Not for 'once'."),
         daysOfWeek: z.array(z.string()).optional().describe("Weekly: the weekdays to run on (MONDAY … SUNDAY or MON … SUN); default = the start's weekday. Monthly with `occurrence`: the one weekday."),
         dayOfMonth: z.number().int().min(1).max(30).optional().describe("Monthly 'ON DAY': 1–30; default = the start's day."),
         occurrence: z.enum(['first', 'second', 'third', 'last']).optional().describe("Monthly 'ON THE': the first / second / third / last weekday of the month — give the weekday in daysOfWeek."),
@@ -640,10 +652,14 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
       // MAINFRAME / SAP / DESKTOP test cases have no browser/platform pick — asking for one blocks
       // those runs (and pushes callers into a local fallback), so gate strictly on WEB.
       if ((tcType === 'WEB' || tcType === 'WEB_DEPRECATED') && !browser) {
+        const cloudChoices = mode === 'cloud' ? adapter.cloudBrowserOptions?.() : undefined;
         return err(
-          "ASK the user which BROWSER to run in (chromium / chrome / msedge / firefox / webkit), " +
-            'then call tc_run again with browser set. Required — the UI marks this field with a ' +
-            'red asterisk.',
+          cloudChoices
+            ? `ASK the user which BROWSER to run in on the cloud — ${cloudChoices.join(' / ')} (cloud runs are headless; do NOT offer chrome / firefox / webkit), ` +
+              'then call tc_run again with browser set. Required — the UI marks this field with a red asterisk.'
+            : "ASK the user which BROWSER to run in (chromium / chrome / msedge / firefox / webkit), " +
+              'then call tc_run again with browser set. Required — the UI marks this field with a ' +
+              'red asterisk.',
         );
       }
 
@@ -910,7 +926,7 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
         releaseId: z.string().optional().describe("STEP 4 — release from list_releases. ASK the user; pass '' to skip (no release / no sprint asked)."),
         sprintId: z.string().optional().describe("STEP 5 — sprint from list_sprints (scoped to release). Only asked when releaseId is non-empty; skipped when releaseId=''. Pass '' to skip."),
         environment: z.string().optional().describe('STEP 6 — environment key (from tc_list_environments). ASK the user on EVERY suite run; the UI marks this required for a suite. Never inherited from a previous run — reuseConfig does not fill it.'),
-        browser: z.string().optional().describe("Optional at the SUITE level — each TC in the suite has its own execution platform (that's the suite-editor pick per row). Provide only to OVERRIDE for every WEB TC. Values: 'chromium' (default), 'chrome'/'msedge', 'firefox', 'webkit'. NOTE: a schedule accepts only chromium/msedge/firefox/webkit."),
+        browser: z.string().optional().describe("Optional at the SUITE level — each TC in the suite has its own execution platform (that's the suite-editor pick per row). Provide only to OVERRIDE for every WEB TC. Values: 'chromium' (default), 'chrome'/'msedge', 'firefox', 'webkit'. " + CLOUD_BROWSER_NOTE + ' ' + SCHEDULE_BROWSER_NOTE),
         headless: z.boolean().optional().describe('Headless. Defaults: cloud=true, local=false. (Immediate runs only.)'),
         agentId: z.string().optional().describe("STEP 8 — for local: a credential_id from `local_agents` (this machine only; omit to auto-pick). For remote: REQUIRED — a credential_id from `remote_agents`. when:'immediate' → picked agent must be ONLINE; when:'schedule' → offline OK, agentId REQUIRED for both local and remote."),
         cloudRunnerId: z.string().optional().describe("STEP 8 (cloud) — a specific ONLINE runner id (from cloud_runners). For when:'schedule' omit to auto-pick a live VM at fire time."),
@@ -927,7 +943,7 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
         endDate: z.string().optional().describe(END_DATE_DESC),
         timezone: z.string().optional().describe("IANA timezone for a schedule (e.g. 'Asia/Kolkata'). Default 'UTC'."),
         scheduleName: z.string().min(3).max(501).optional().describe("when:'schedule' — the schedule's NAME as the Scheduler shows it (3–501 characters, unique in the project), e.g. 'nightly smoke'. Omit it and the schedule is named '<TC-22> schedule' (numbered when taken)."),
-        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1. Not for 'once' / 'every_5_minutes' (fixed at 5 minutes — SimplifyQA has no other minute interval)."),
+        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1. With 'every_5_minutes' it is the N in 'every N minutes'. Not for 'once'."),
         daysOfWeek: z.array(z.string()).optional().describe("Weekly: the weekdays to run on (MONDAY … SUNDAY or MON … SUN); default = the start's weekday. Monthly with `occurrence`: the one weekday."),
         dayOfMonth: z.number().int().min(1).max(30).optional().describe("Monthly 'ON DAY': 1–30; default = the start's day."),
         occurrence: z.enum(['first', 'second', 'third', 'last']).optional().describe("Monthly 'ON THE': the first / second / third / last weekday of the month — give the weekday in daysOfWeek."),
@@ -1129,10 +1145,12 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
               ? `on remote agent \`${agentId}\``
               : `locally${agentId ? ` on agent \`${agentId}\`` : ' on your online agent'}`;
         if (projectId) lastRun.set(projectId, { when, mode, releaseId, sprintId, browser, agentId, cloudRunnerId: resolvedRunner?.id ?? cloudRunnerId });
+        const defectNote = await autoDefectLogRunNote(adapter, 'suite', suiteId);
         return ok(
           `Started suite ${suiteId} ${where}. Run id \`${run.runId}\` — poll run_status({ runId: "${run.runId}" }) for progress.` +
             (run.reportUrl ? `
-Report: ${run.reportUrl} (use this link as-is; do not build a report URL yourself)` : ''),
+Report: ${run.reportUrl} (use this link as-is; do not build a report URL yourself)` : '') +
+            (defectNote ? `\n${defectNote}` : ''),
           { run, mode, ...(resolvedRunner ? { runner: resolvedRunner } : {}) },
         );
       } catch (e) {
@@ -1360,13 +1378,13 @@ Report: ${run.reportUrl} (use this link as-is; do not build a report URL yoursel
         sprintId: z.string().optional().describe('Sprint: id, code (SP-1) or exact name; it must belong to the release. "none" clears it.'),
         scheduledFor: z.string().optional().describe('New start / next-run ISO datetime.'),
         scheduleType: z.enum(SCHEDULE_TYPES).optional().describe('New recurrence (same choices as the UI: once, every_5_minutes, hourly, daily, weekly, monthly). Anything but once needs an endDate.'),
-        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1; giving it alone changes the schedule's current cadence. Not for 'once' / 'every_5_minutes' (fixed at 5 minutes — SimplifyQA has no other minute interval)."),
+        interval: z.number().int().min(1).optional().describe("REPEAT EVERY N for hourly / daily / weekly / monthly — N hours / days / weeks / months (e.g. hourly + 2 = every 2 hours). Default 1; giving it alone changes the schedule's current cadence. With 'every_5_minutes' it is the N in 'every N minutes'."),
         daysOfWeek: z.array(z.string()).optional().describe("Weekly: the weekdays to run on (MONDAY … SUNDAY or MON … SUN); default = the start's weekday. Monthly with `occurrence`: the one weekday."),
         dayOfMonth: z.number().int().min(1).max(30).optional().describe("Monthly 'ON DAY': 1–30; default = the start's day."),
         occurrence: z.enum(['first', 'second', 'third', 'last']).optional().describe("Monthly 'ON THE': the first / second / third / last weekday of the month — give the weekday in daysOfWeek."),
         endDate: z.string().optional().describe('New ISO end date (for recurring schedules).'),
         timezone: z.string().optional().describe("New IANA timezone (e.g. 'Asia/Kolkata')."),
-        browser: z.enum(['chromium', 'msedge', 'firefox', 'webkit']).optional().describe('New browser (schedules accept chromium/msedge/firefox/webkit, not chrome).'),
+        browser: z.string().optional().describe(SCHEDULE_BROWSER_DESC),
         environment: z.string().optional().describe('New environment id (Mongo id).'),
         mode: z.enum(['local', 'cloud']).optional().describe('Re-pin target: pair with agentId (local) or cloudRunnerCredentialId (cloud).'),
         agentId: z.string().optional().describe('Local re-pin: an agent credential_id from local_agents.'),

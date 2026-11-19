@@ -70,7 +70,7 @@ describe('create a schedule with a recurrence', () => {
   test('settings a cadence does not have are refused with the reason — never silently dropped', async () => {
     const refuse = (opts: Record<string, unknown>, re: RegExp) => expect(create(opts)).rejects.toThrow(re);
     await refuse({ scheduleType: 'once', interval: 2 }, /A Once schedule has no recurrence settings/);
-    await refuse({ scheduleType: 'every_5_minutes', interval: 10 }, /fixed at 5 minutes.*no other minute interval.*hourly.*interval/s);
+    // "every N minutes" is supported: EVERY_5_MINUTES + interval N (checked in the cadence test below).
     await refuse({ scheduleType: 'hourly', interval: 0 }, /whole number, 1 or more/);
     await refuse({ scheduleType: 'hourly', interval: 1.5 }, /whole number, 1 or more/);
     await refuse({ scheduleType: 'daily', daysOfWeek: ['MONDAY'] }, /daysOfWeek applies to a weekly/);

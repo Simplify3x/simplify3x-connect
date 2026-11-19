@@ -1803,42 +1803,60 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
   // Kept beside suite_list/suite_get so all suite tools live together; they mutate
   // via the adapter's updateSuiteMembers (→ update_suite_members provider-op).
 
-  const testCasesTable = (suite: { members: { tcId: string; order: number }[] }): string =>
+  const testCasesTable = (suite: { members: { tcId: string; order: number; versionId?: string }[] }): string =>
     suite.members.length
-      ? '\n\n| order | test case |\n|---|---|\n' +
-        suite.members.map((m) => `| ${m.order} | ${escCell(m.tcId)} |`).join('\n')
+      ? '\n\n| order | test case | version |\n|---|---|---|\n' +
+        suite.members.map((m) => `| ${m.order} | ${escCell(m.tcId)} | ${escCell(m.versionId ?? '')} |`).join('\n')
       : '';
 
   server.registerTool(
     'suite_add_testcases',
     {
-      title: 'Add test cases to a suite',
+      title: 'Add test cases to a suite (optionally a specific VERSION of each)',
       description:
-        'Add one or more EXISTING test cases to a suite (appended in order). `tcIds` accepts ids or ' +
-        'business keys (e.g. TC_123) — use suite_list / tc_list to find them. NOTE: a suite can only ' +
-        'hold test cases of ONE category (all manual OR all automated) — the product rejects a mix. ' +
-        'Requires a live connection. Returns the updated suite with its test cases.',
+        'Add one or more EXISTING test cases to a suite (appended in order). `tcIds` takes ids or business ' +
+        'keys (e.g. TC_123); use suite_list / tc_list to find them. To pin a VERSION, pass ' +
+        '`testCases:[{ tcId:"TC-12826", version:"v2.0" }]` (or `versionId`) — the same test case can sit in ' +
+        'the suite once per version (v1.0 and v2.0 are two rows). A requested version that does not exist ' +
+        'is an ERROR (nothing is added twice as v1.0). Default = the test case\'s current version; an ' +
+        '(tc, version) pair already in the suite is skipped. NOTE: a suite can only hold test cases of ONE ' +
+        'category (all manual OR all automated) — the product rejects a mix. Returns the updated suite.',
       inputSchema: {
         suiteId: z.string().describe('The suite id to add to (from suite_list).'),
-        tcIds: z.array(z.string()).min(1).describe('Test case ids / business keys to add.'),
+        tcIds: z.array(z.string()).optional().describe('Test case ids / business keys to add (their current version).'),
+        testCases: z.array(z.object({
+          tcId: z.string().describe('Test case id or business key.'),
+          versionId: z.string().optional().describe('Pin this version id (from the TC versions[]).'),
+          version: z.string().optional().describe('Pin this version NAME (e.g. "v2.0"); ignored when versionId is given.'),
+        })).optional().describe('Test cases with an explicit version — lets one TC be added once per version.'),
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ suiteId, tcIds }) => {
+    async ({ suiteId, tcIds, testCases }) => {
       const adapter = deps.getAdapter();
       if (!adapter) return err(NOT_CONNECTED);
+      const wanted: Array<{ tcId: string; versionId?: string; version?: string }> = [
+        ...(tcIds ?? []).map((tcId) => ({ tcId })),
+        ...(testCases ?? []),
+      ];
+      if (!wanted.length) return err('suite_add_testcases needs tcIds or testCases.');
       try {
-        const ops: MemberOp[] = tcIds.map((tcId) => ({ op: 'add', tcId }));
+        const ops: MemberOp[] = wanted.map((w) => ({
+          op: 'add', tcId: w.tcId,
+          ...(w.versionId ? { versionId: w.versionId } : {}),
+          ...(w.version ? { version: w.version } : {}),
+        }));
         const suite = await adapter.updateSuiteMembers(suiteId, ops);
         const n = suite.members.length;
         // Resolve titles for the confirmation — membership rows only carry `tcId`.
         const added = await Promise.all(
-          tcIds.map(async (tcId) => {
+          wanted.map(async (w) => {
+            const label = w.versionId ?? w.version;
             try {
-              const tc = await adapter.getTestCase(tcId);
-              return tc.title ? `${tc.title} (${tcId})` : tcId;
+              const tc = await adapter.getTestCase(w.tcId);
+              return `${tc.title ? `${tc.title} (${w.tcId})` : w.tcId}${label ? ` [${label}]` : ''}`;
             } catch {
-              return tcId;
+              return `${w.tcId}${label ? ` [${label}]` : ''}`;
             }
           }),
         );
@@ -1900,15 +1918,19 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
       inputSchema: {
         tcId: z.string().describe('Test case id or business key.'),
         pattern: z.string().optional().describe('Case-insensitive substring filter over step descriptions.'),
+        versionId: z.string().optional().describe(
+          'SimplifyQA, multi-version test cases: the version to read — its id or name (e.g. "v2.0"). Omit for the current version. ' +
+            'Use the SAME value in journal_modify to edit that version.',
+        ),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ tcId, pattern }) => {
+    async ({ tcId, pattern, versionId }) => {
       const adapter = deps.getAdapter();
       if (!adapter) return err(NOT_CONNECTED);
       if (!adapter.readJournal) return err('This product has no recording journal.');
       try {
-        const view = await adapter.readJournal(tcId);
+        const view = await adapter.readJournal(tcId, versionId || undefined);
         const p = pattern?.toLowerCase();
         const rows = view.steps
           .filter((s) => !p || (s.description ?? '').toLowerCase().includes(p))
@@ -1921,7 +1943,8 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
             ? ` · journal seed${view.ageDays != null ? ` (${view.ageDays}d old)` : ''}`
             : ' · NO journal seed — showing persisted steps (a new-interaction add would be steps-only)';
         const header =
-          `**${tcId}** — ${view.steps.length} step${view.steps.length === 1 ? '' : 's'} · source: ${view.source}${staleness}`;
+          `**${tcId}** — ${view.steps.length} step${view.steps.length === 1 ? '' : 's'} · source: ${view.source}${staleness}` +
+          (view.version && (view.versionCount ?? 0) > 1 ? ` · version ${view.version.name} (of ${view.versionCount})` : '');
         const body = rows.length
           ? '\n\n| n | type | description |\n|---|---|---|\n' + rows.join('\n')
           : `\n\n(no steps${pattern ? ' match the filter' : ''})`;
@@ -1961,14 +1984,21 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
         'needs NO element — e.g. Minimum Wait — needs none. Use add_step { at?, step: { actionType:"Minimum Wait", ' +
         'stepType, description, value? } } — `at` (alias `seq`) is the 1-based position the new step takes; it is ' +
         'inserted there DIRECTLY (the recorder window does not open) and the other steps just shift down. ' +
+        'A test case with SEVERAL VERSIONS: edits go to the current version unless you pass `versionId` (id or name, e.g. "v2.0") — ' +
+        'read that version first with journal_grep { tcId, versionId } so the step numbers match. ' +
         'Requires a live connection.',
       inputSchema: {
         tcId: z.string().describe('Test case id or business key.'),
         ops: z.array(zJournalOp).min(1).describe('Ops to apply, in order.'),
+        versionId: z.string().optional().describe(
+          'SimplifyQA, multi-version test cases: the version to edit — its id or name (e.g. "v2.0"); step numbers are that version\'s ' +
+            '(read it with journal_grep { versionId }). Omit to edit the CURRENT version. wrap_in_if / wrap_in_loop need the agent and ' +
+            'only work on the current version.',
+        ),
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ tcId, ops }) => {
+    async ({ tcId, ops, versionId }) => {
       const adapter = deps.getAdapter();
       if (!adapter) return err(NOT_CONNECTED);
       if (!adapter.editJournal) return err('This product has no editable recording journal.');
@@ -1985,12 +2015,16 @@ export function registerDiscoveryTools(server: McpServer, deps: DiscoveryToolsDe
         );
       }
       try {
-        const view = await adapter.editJournal(tcId, ops as JournalOp[]);
+        const view = await adapter.editJournal(tcId, ops as JournalOp[], versionId || undefined);
         const rows = view.steps.map(
           (s) => `| ${s.n} | ${escCell(s.stepType)}${s.controlFlow ? `/${s.controlFlow.kind}` : ''} | ${escCell(s.description)} |`,
         );
+        // Name the version that was changed whenever there is a choice, so an edit never lands unnoticed on the wrong one.
+        const onVersion = view.version && (view.versionCount ?? 0) > 1
+          ? ` (version ${view.version.name}${versionId ? '' : ' — the current one; pass versionId to edit another version'})`
+          : '';
         return ok(
-          `Updated **${tcId}** — ${view.steps.length} step${view.steps.length === 1 ? '' : 's'}${view.source === 'steps' ? '' : ' (opened in the editor)'}.` +
+          `Updated **${tcId}**${onVersion} — ${view.steps.length} step${view.steps.length === 1 ? '' : 's'}${view.source === 'steps' ? '' : ' (opened in the editor)'}.` +
             '\n\n| n | type | description |\n|---|---|---|\n' +
             rows.join('\n'),
           { view },

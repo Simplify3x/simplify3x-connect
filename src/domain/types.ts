@@ -651,14 +651,22 @@ export type QaObject = {
   pageScreenshotUrl?: string | undefined;
 };
 export type ObjectQuery = { query?: string; pageName?: string; limit?: number; offset?: number };
-export type Suite = { id?: string; name: string; description?: string; members: { tcId: string; order: number }[];
+export type Suite = { id?: string; name: string; description?: string;
+  members: { tcId: string; order: number; version?: string; versionId?: string }[];
   /** SimplifyQA Execution Type (LOCAL / REMOTE / CLOUD / STACK) — the suite's own menu value. */
   executionType?: string | undefined };
 /** `suiteType` is SimplifyQA-only ("MANUAL" | "AUTOMATION"); absent on Walnut. */
 export type SuiteSummary = { id: string; name: string; memberCount?: number; suiteType?: string | undefined;
   /** SimplifyQA Execution Type (LOCAL / REMOTE / CLOUD / STACK). */
   executionType?: string | undefined };
-export type MemberOp = { op: 'add' | 'remove' | 'reorder'; tcId: string; order?: number };
+export type MemberOp = {
+  op: 'add' | 'remove' | 'reorder';
+  tcId: string;
+  order?: number;
+  /** add: pin a specific version of the test case (id or name). Omit = the test case's current version. */
+  versionId?: string;
+  version?: string;
+};
 export type RunTarget = { tcId?: string; suiteId?: string; planId?: string };
 /** A single device entry for multi-device parallel execution. Each entry becomes one executionItem
  *  inside a SINGLE execution (one execution ID, multiple parallel runs). */
@@ -1034,6 +1042,9 @@ export type JournalView = {
   savedAt?: string | undefined;
   ageDays?: number | undefined;
   entryCount?: number | undefined;
+  /** The version these steps belong to (SimplifyQA, saved steps only) and how many versions the test case has. */
+  version?: { id: string; name: string } | undefined;
+  versionCount?: number | undefined;
 };
 /** One API response assertion, as an LLM writes it. `path` is the live-request form
  *  (`statusCode`, `responseTime`, `responseSize`, `$.body.x`, `$.headers.Name`); the mapper

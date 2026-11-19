@@ -117,7 +117,7 @@ describe('suite stack run', () => {
 
   test('a normal (non-stack) run is unchanged: items are sent, strategy honoured', async () => {
     const { a, writes } = backend();
-    await a.startSuiteRun('SU-28', { mode: 'cloud', strategy: 'parallel', environment: 'general' });
+    await a.startSuiteRun('SU-28', { mode: 'cloud', strategy: 'parallel', environment: 'general', browser: 'chrome' });
     const body = runBody(writes);
     expect([body.mode, body.executionStyle]).toEqual(['CLOUD', 'PARALLEL']);
     expect(body.executionItems).toHaveLength(4);

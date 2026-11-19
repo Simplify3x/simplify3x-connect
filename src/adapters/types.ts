@@ -274,10 +274,11 @@ export interface ProviderAdapter {
   /** Walnut-only: the recording-JOURNAL view of a test case (steps derived from its journal seed,
    *  or the persisted steps when no seed exists) — the read side of journal-first editing. Absent on
    *  providers with no recording journal. */
-  readJournal?(tcId: string): Promise<JournalView>;
+  readJournal?(tcId: string, versionId?: string): Promise<JournalView>;
   /** Walnut-only: apply granular modify ops (add/remove/update/move step, wrap in loop/if, insert
-   *  nested) to a test case and persist — the write side of journal-first editing. */
-  editJournal?(tcId: string, ops: JournalOp[]): Promise<JournalView>;
+   *  nested) to a test case and persist — the write side of journal-first editing. SimplifyQA also
+   *  takes `versionId` (a version id or name) to read/edit a version other than the current one. */
+  editJournal?(tcId: string, ops: JournalOp[], versionId?: string): Promise<JournalView>;
 
   listSuites(): Promise<SuiteSummary[]>;
   /** SimplifyQA-only: create an ENVIRONMENT (project configuration > Environments). Absent elsewhere. */
@@ -324,12 +325,12 @@ export interface ProviderAdapter {
   }): Promise<{ users: number[]; mailersList: Record<string, unknown> }>;
   /** Link a backlog item to another item with a link type (the UI's Linkages section). */
   linkBacklogItem?(input: {
-    sourceType: 'epic' | 'feature' | 'userstory';
+    sourceType: 'epic' | 'feature' | 'userstory' | 'defect';
     sourceId: string;
     destType: 'epic' | 'feature' | 'userstory' | 'defect' | 'task';
     destId: string;
     linkType: string;
-  }): Promise<{ linkTypeKey: string; destinationCode?: string; linkedIssues: Array<Record<string, unknown>> }>;
+  }): Promise<{ linkTypeKey: string; destinationCode?: string; linkedIssues: Array<Record<string, unknown>>; alreadyLinked?: boolean }>;
 
   /** SimplifyQA-only: modules / folders in the test-case tree, so a draft can be filed under a
    *  chosen module on save. Absent on providers with no module tree (Walnut). */
@@ -441,6 +442,8 @@ export interface ProviderAdapter {
   /** Cloud runner VMs registered to the project, with online status. Optional: only products with a
    *  cloud-execution fabric implement it; absence = "this provider has no cloud runners". */
   listCloudRunners?(): Promise<CloudRunner[]>;
+  /** The browsers a CLOUD run offers, when they differ from a local run's (SimplifyQA: the headless ones). Absent = the usual list. */
+  cloudBrowserOptions?(): string[];
   /** LOCAL agents registered to the project, with online status. Optional: only products with a local
    *  agent fabric implement it; absence = "this provider has no local agents to pick". */
   listLocalAgents?(): Promise<LocalAgent[]>;

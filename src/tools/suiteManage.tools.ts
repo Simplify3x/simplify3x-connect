@@ -11,7 +11,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
 import { autoDefectLogNote, autoDefectLogRefusal } from './autoDefectLog.js';
-import type { SuiteBlockers, SuiteRef, SuiteSettings, SuiteSettingsView } from '../adapters/simplifyqa/adapter.js';
+import { STACK_SETUP_DESC, stackConfigsSchema, stackSetupReply } from './stackSetupTool.js';
+import type { StackSetupInput, StackSetupResult, SuiteBlockers, SuiteRef, SuiteSettings, SuiteSettingsView } from '../adapters/simplifyqa/adapter.js';
 
 export type SuiteManageDeps = { getAdapter: () => ProviderAdapter | null };
 
@@ -21,9 +22,7 @@ type SuiteWrites = {
   updateSuite: (id: string, patch: { name?: string; description?: string; executionType?: string }) => Promise<unknown>;
   updateSuiteSettings: (id: string, settings: SuiteSettings) => Promise<unknown>;
   getSuiteSettings: (id: string) => Promise<SuiteSettingsView>;
-  configureSuiteStacks: (id: string, opts: { count: number; mode?: 'CLOUD' | 'LOCAL'; browser?: string }) => Promise<{
-    created: boolean; cloudAvailable?: boolean; stacks: Array<{ id: string; name: string; mode: string; codes: string[] }>;
-  }>;
+  configureSuiteStacks: (id: string, opts: StackSetupInput) => Promise<StackSetupResult>;
 };
 
 const NOT_CONNECTED =
@@ -57,17 +56,18 @@ export function registerSuiteManageTools(server: McpServer, deps: SuiteManageDep
         '- action:"delete" — needs `suiteId`. TWO-STEP: call without `confirm` to PREVIEW (nothing is ' +
         'deleted), show it to the user, and call again with `confirm:true` ONLY after the user explicitly ' +
         'says to delete. A suite still used by a schedule, pipeline, execution plan or test plan is refused.\n' +
-        '- action:"stack_setup" — needs `suiteId` and `stacks` (how many). Saves the suite\'s STACK setup (the ' +
-        'Stack canvas behind Execution Type → Stack): N stacks with the suite\'s test cases spread across ' +
-        'them round-robin (every stack needs at least one). `stackMode` "cloud" (default) or "local"; ' +
-        '`browser` for WEB cases. Then run it with suite_run mode:"stack".\n' +
+        '- action:"stack_setup" — needs `suiteId` and `stacks` (how many) or `stackConfigs`. Saves the suite\'s STACK setup (the ' +
+        'Stack canvas behind Execution Type → Stack). ' + STACK_SETUP_DESC + ' `stackMode` "cloud" (default) or "local" and ' +
+        '`browser` are the defaults for stacks that do not say.\n' +
         'AUTO DEFECT LOGGING for the suite = action:"update" with settings:{ autoDefectLog:true } (failed steps then log ' +
         'a defect automatically). It needs the project\'s admin "Auto Defect Logging" switch on; if it is off the call is ' +
         'refused with that instruction — tell the user to ask an admin to enable it, then retry.\n' +
         'Add/remove member test cases with suite_add_testcases / suite_remove_testcases; create with suite_create.',
       inputSchema: {
         action: z.enum(['get', 'update', 'delete', 'stack_setup']).describe('What to do with the suite.'),
-        stacks: z.number().int().min(1).optional().describe('action "stack_setup": number of stacks.'),
+        stacks: z.number().int().min(1).optional().describe('action "stack_setup": number of stacks — with append:true, how many to ADD. Omit when stackConfigs lists them.'),
+        stackConfigs: stackConfigsSchema,
+        append: z.boolean().optional().describe('action "stack_setup": add the stack(s) to the saved setup instead of replacing it.'),
         stackMode: z.enum(['cloud', 'local']).optional().describe('action "stack_setup": where the stacks run (default cloud).'),
         browser: z.string().optional().describe('action "stack_setup": browser for WEB test cases (default chrome).'),
         suiteId: z.string().optional().describe('Suite id or code (SU-12). Needed by every action.'),
@@ -88,7 +88,7 @@ export function registerSuiteManageTools(server: McpServer, deps: SuiteManageDep
       },
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
-    async ({ action, suiteId, name, description, executionType, settings, confirm, stacks, stackMode, browser }) => {
+    async ({ action, suiteId, name, description, executionType, settings, confirm, stacks, stackConfigs, append, stackMode, browser }) => {
       const adapter = deps.getAdapter() as (ProviderAdapter & Partial<SuiteWrites>) | null;
       if (!adapter) return err(NOT_CONNECTED);
       if (!adapter.suiteDeletePreview || !adapter.deleteSuite || !adapter.updateSuite || !adapter.updateSuiteSettings || !adapter.getSuiteSettings) {
@@ -96,18 +96,17 @@ export function registerSuiteManageTools(server: McpServer, deps: SuiteManageDep
       }
       try {
         if (action === 'stack_setup') {
-          if (!suiteId || !stacks) return err('suite_manage action:"stack_setup" needs: suiteId and stacks (how many).');
+          if (!suiteId || (!stacks && !stackConfigs?.length)) return err('suite_manage action:"stack_setup" needs: suiteId and stacks (how many) or stackConfigs.');
           if (!adapter.configureSuiteStacks) return err('Stack setup is not available on this connection.');
           const res = await adapter.configureSuiteStacks(suiteId, {
-            count: stacks,
+            ...(stacks ? { count: stacks } : {}),
+            ...(stackConfigs?.length ? { stackConfigs } : {}),
             mode: stackMode === 'local' ? 'LOCAL' : 'CLOUD',
             ...(browser ? { browser } : {}),
+            ...(append ? { append: true } : {}),
           });
           return ok(
-            `${res.created ? 'Created' : 'Updated'} the Stack setup of ${suiteId}: ${res.stacks.length} stack(s).\n` +
-              res.stacks.map((s) => `- ${s.name} (${s.mode}): ${s.codes.join(', ')}`).join('\n') +
-              (res.cloudAvailable === false ? '\n⚠️ This project has no cloud machine configured, so CLOUD stacks cannot run yet.' : '') +
-              `\nRun it with suite_run({ suiteId: "${suiteId}", mode: "stack" }).`,
+            stackSetupReply(suiteId, res, `Run it with suite_run({ suiteId: "${suiteId}", mode: "stack" }).`),
             res as unknown as Record<string, unknown>,
           );
         }

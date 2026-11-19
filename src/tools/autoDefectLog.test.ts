@@ -79,9 +79,9 @@ describe('autoDefectLogStatus (adapter)', () => {
     return a;
   };
   test('reads generalSettings.defectManagement.autoDefectFlag; unreadable → undefined', async () => {
-    expect(await adapterWith({ generalSettings: { defectManagement: { autoDefectFlag: true } } }).autoDefectLogStatus()).toEqual({ adminEnabled: true });
-    expect(await adapterWith({ generalSettings: { defectManagement: { autoDefectFlag: false } } }).autoDefectLogStatus()).toEqual({ adminEnabled: false });
-    expect(await adapterWith({}).autoDefectLogStatus()).toEqual({ adminEnabled: false });
+    expect(await adapterWith({ generalSettings: { defectManagement: { autoDefectFlag: true } } }).autoDefectLogStatus()).toMatchObject({ adminEnabled: true });
+    expect(await adapterWith({ generalSettings: { defectManagement: { autoDefectFlag: false } } }).autoDefectLogStatus()).toMatchObject({ adminEnabled: false });
+    expect(await adapterWith({}).autoDefectLogStatus()).toMatchObject({ adminEnabled: false });
     expect(await adapterWith(new Error('403')).autoDefectLogStatus()).toBeUndefined();
   });
 });

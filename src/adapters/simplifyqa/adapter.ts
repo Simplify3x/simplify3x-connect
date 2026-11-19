@@ -34,6 +34,7 @@ import { mergeApiPatch } from '../../drafts/apiPatch.js';
 import { matchStepNumbers } from '../../drafts/bulk.js';
 import { resolveCollection } from './searchRegistry.js';
 import { mapLimit } from './mapLimit.js';
+import { distributeCases, firstEmptyStack, pickBrowser, resolveStacks, type CaseRef, type StackMode, type StackSpec, type UiBrowser } from './stackSetup.js';
 import { ExecutionFailureAnalysis, fetchFailureImage } from './executionFailures.js';
 import { log } from '../../log.js';
 import type { HealApplyMode, HealPlan, HealProposeInput, HealReport } from '../../domain/heal.js';
@@ -415,10 +416,14 @@ const STORY_FORM_KEYS = [
   'linkedIssues', 'tags', 'teamId', 'mailersList', 'subProjectId', 'versionId', 'azureId', 'azureUrl',
   'jiraIssueId', 'jiraIssueKey', 'jiraIssueLink',
 ] as const;
+/** Items that can carry attachments. A DEFECT differs from the others: its update takes only the fields being changed, the files are
+ *  the multipart `filename1…` parts, and its `attachments` list names the rows to DELETE (each with `deleted:true`) — it is not the list to keep. */
+export type AttachmentEntity = 'epic' | 'feature' | 'userstory' | 'defect';
 const BACKLOG_ATTACHMENT_SPECS = {
   epic: { path: '/pm/epic', objKey: 'epicObj', parentType: 'EP', keys: EPIC_FORM_KEYS },
   feature: { path: '/pm/feature', objKey: 'featureObj', parentType: 'FT', keys: FEATURE_FORM_KEYS },
   userstory: { path: '/pm/userstory', objKey: 'userstoryObj', parentType: 'US', keys: STORY_FORM_KEYS },
+  defect: { path: '/pm/defect', objKey: 'defectObj', parentType: 'DE', keys: [] as readonly string[] },
 } as const;
 
 const STEP_ALLOWED_KEYS = [  'projectId', 'sharedFnProjectId', 'moduleId', 'apiData', 'lastActiveTab', 'userstoryId',
@@ -533,6 +538,26 @@ function gateHttp(http: QaHttp, gate: () => Promise<void>): QaHttp {
 /** A named item a suite depends on (schedule, pipeline, execution plan, test plan). */
 export type SuiteRef = { id: string; code?: string; name?: string };
 export type SuiteBlockers = { schedules: SuiteRef[]; pipelines: SuiteRef[]; executionPlans: SuiteRef[]; testPlans: SuiteRef[] };
+/** What `stack_setup` takes: a count (all stacks alike) or `stackConfigs` (one entry per stack: platform, browser, machine,
+ *  test cases); `append` adds to the saved setup instead of replacing it. */
+export type StackSetupInput = {
+  count?: number | undefined; mode?: 'CLOUD' | 'LOCAL' | 'REMOTE' | undefined; browser?: string | undefined;
+  stackConfigs?: StackSpec[] | undefined; append?: boolean | undefined;
+};
+export type StackSetupResult = {
+  created: boolean;
+  /** CLOUD stacks only: whether the project has a cloud machine to run them on. */
+  cloudAvailable?: boolean;
+  stacks: Array<{ id: string; name: string; mode: string; agentId?: string; browser?: string; codes: string[] }>;
+  /** Test cases no stack holds (named stacks left them out) — they will not run in a Stack run. */
+  unassigned?: string[];
+  notes?: string[];
+};
+/** One test case of a plan / suite as the stack canvas needs it: how to name it, and how to build its item for a given platform. */
+type StackCase = {
+  ref: CaseRef; key: string; tech: string; nativePlatform: Record<string, unknown>;
+  item: (platform: unknown[]) => Record<string, unknown>;
+};
 /** Execution settings `PUT /tm/suites/settings/:id` accepts (UAT updateSuiteSettingsBodyValidation). */
 export type SuiteSettings = {
   autoDefectLog?: boolean; autoReExecCount?: number; autoReExecTriggerOn?: string; newBrowserSession?: boolean;
@@ -593,7 +618,17 @@ const EP_UPDATE_KEYS = [
 const EP_READ_ONLY_STATUSES = ['REVIEW PENDING', 'APPROVE PENDING', 'REVIEWED', 'APPROVED'];
 
 /** What to add to a plan: test cases and/or every live test case of suites, optionally assigned. */
-export type PlanEntryInput = { tcIds?: string[]; suiteIds?: string[]; assignTo?: string; assignDate?: string };
+export type PlanEntryInput = {
+  tcIds?: string[];
+  suiteIds?: string[];
+  assignTo?: string;
+  assignDate?: string;
+  /** Pin ONE version for every `tcIds` entry (id or name). Omit = each test case's current version. */
+  versionId?: string;
+  version?: string;
+  /** Per-test-case versions — lets the same test case be added once per version (v1.0 AND v2.0). */
+  testCases?: Array<{ tcId: string; versionId?: string | undefined; version?: string | undefined }>;
+};
 /** One plan entry, as shown before removing it. */
 export type PlanEntryRef = { id: string; code: string; tcName: string; assignedTo?: number };
 
@@ -624,9 +659,19 @@ export type DefectCreateInput = {
   name: string; description?: string | undefined; state?: string | undefined; priority?: string | undefined; severity?: string | undefined;
   category?: string | undefined; assignee?: string | undefined; releaseId?: string | undefined; sprintId?: string | undefined; storyId?: string | undefined;
   testCases?: string[] | undefined; module?: string | undefined; estimatedEffort?: number | undefined; customFields?: Record<string, unknown> | undefined;
+} & DefectFormExtras;
+/** The defect form's remaining fields. Environment and Type (the form's Execution Type) are checked against the project's own list, or the
+ *  form's fixed one (Development / QA / UAT, Manual / Automation) when the project defines none; Feature must be a feature of the project;
+ *  the planned dates are YYYY-MM-DD ('none' clears one when updating); each link is saved from the DEFECT's side. */
+export type DefectFormExtras = {
+  environment?: string | undefined; executionType?: string | undefined; featureId?: string | undefined;
+  plannedStartDate?: string | undefined; plannedEndDate?: string | undefined; linkages?: DefectLinkSpec[] | undefined;
 };
+export type DefectLinkSpec = { destType: 'epic' | 'feature' | 'userstory' | 'defect' | 'task'; destId: string; linkType: string };
 export type DefectCreateResult = {
   defectId: string; defectCode: string; name: string; state: string; priority: string; severity?: string; testCases: string[]; storyId?: number;
+  /** What the extra form fields read back as (environment, type, feature, planned dates) and the links saved ('DE-9 (Clones)'). */
+  fields?: string[]; linked?: string[];
   defaults: string[]; warnings: string[];
 };
 /** `defect_create_from_step`: the failed step of an execution report (`executionId` EX-170, `step` number, `tc` when the execution ran several
@@ -650,7 +695,7 @@ export type DefectUpdateInput = {
   storyId?: string | undefined; testCases?: string[] | undefined; removeTestCases?: string[] | undefined; clearTestCases?: boolean | undefined;
   state?: string | undefined; priority?: string | undefined; severity?: string | undefined; name?: string | undefined; description?: string | undefined;
   assignee?: string | undefined; unassign?: boolean | undefined; releaseId?: string | undefined; sprintId?: string | undefined;
-};
+} & DefectFormExtras;
 /** The result of a defect update: each change as it read before and after; `written` is false when nothing needed changing. */
 export type DefectUpdateResult = { id: string; code: string; name: string; changes: Array<{ field: string; from: string; to: string }>; written: boolean; warnings: string[] };
 /** What `task_update` may change. `assignee` is a user id, email, name or "me"; `unassign` clears it. */
@@ -706,11 +751,48 @@ function testcaseVersion(raw: any, optional = false): { versionId: string; versi
   return { versionId: versionId ?? '', versionName: versionName ?? 'v1.0' };
 }
 
+/** Version for a plan/suite entry: the requested one (id or name), else the test case's current one.
+ *  A requested version that does not exist FAILS — silently falling back to v1.0 turned a request for
+ *  v2.0 into a duplicate v1.0 row. */
+export function pickTestcaseVersion(raw: any, wantId?: string, wantName?: string): { versionId: string; versionName: string } {
+  const id = (wantId ?? '').trim();
+  const name = (wantName ?? '').trim();
+  if (!id && !name) return testcaseVersion(raw);
+  const versions: any[] = Array.isArray(raw?.versions) ? raw.versions : [];
+  const hit = versions.find((v) => {
+    const vid = str(v, 'id', '_id', 'versionId') ?? '';
+    const vname = str(v, 'name', 'versionName') ?? '';
+    return (id && vid === id) || (name && vname.trim().toLowerCase() === name.toLowerCase());
+  });
+  if (!hit) {
+    const code = str(raw, 'code') ?? `TC-${raw?.id}`;
+    const available = versions.map((v) => `${str(v, 'name') ?? '?'} (${str(v, 'id', '_id', 'versionId') ?? '?'})`).join(', ');
+    throw new Error(
+      `${code} has no version ${id ? `"${id}"` : `"${name}"`}. Available versions: ${available || '(none)'}. ` +
+        `Read them with sqa_query({ op:"get", collection:"testcases", id:"${code}" }).`,
+    );
+  }
+  return { versionId: str(hit, 'id', '_id', 'versionId') ?? '', versionName: str(hit, 'name', 'versionName') ?? '' };
+}
+
 /** Refused suite delete: something still uses it (the caller lists `blockers`). */
 export class SuiteBlockedError extends Error {
   constructor(readonly suite: SuiteRef, readonly blockers: SuiteBlockers) {
     super(`${suite.code ?? suite.id} is still in use and was not deleted.`);
     this.name = 'SuiteBlockedError';
+  }
+}
+
+/** What still points at a release or sprint — SimplifyQA's own delete checks none of it (it just flags the row deleted). */
+export type PmBlockers = {
+  sprints: SuiteRef[]; stories: SuiteRef[]; defects: SuiteRef[]; tasks: SuiteRef[];
+  executionPlans: SuiteRef[]; pipelines: SuiteRef[]; schedules: SuiteRef[]; otherProjects: SuiteRef[];
+};
+export type PmDeletePreview = { kind: 'release' | 'sprint'; record: SuiteRef & { state?: string }; blockers: PmBlockers; callerIsAdmin: boolean };
+export class PmBlockedError extends Error {
+  constructor(readonly kind: 'release' | 'sprint', readonly record: SuiteRef, readonly blockers: PmBlockers) {
+    super(`${record.code ?? record.id} is still in use and was not deleted.`);
+    this.name = 'PmBlockedError';
   }
 }
 
@@ -766,9 +848,10 @@ function sqaRecurrence(type: ScheduleOptions['scheduleType'], start: string, end
   const recurrenceType = once ? 'ONCE' : type === 'weekdays' ? 'WEEKLY' : type.toUpperCase();
   const given = Object.keys(extra);
   if (given.length) {
-    if (once) throw new Error(`A Once schedule has no recurrence settings (${given.join(', ')}) — pick hourly / daily / weekly / monthly.`);
-    if (type === 'every_5_minutes') {
-      throw new Error('Every 5 Minutes is fixed at 5 minutes — SimplifyQA has no other minute interval. For another cadence use hourly / daily / weekly / monthly with `interval` N (e.g. hourly, interval 2 = every 2 hours).');
+    if (once) throw new Error(`A Once schedule has no recurrence settings (${given.join(', ')}) — pick every_n_minutes / hourly / daily / weekly / monthly.`);
+    if (type === 'every_5_minutes' && extra.interval !== undefined) {
+      // "Every N minutes" — the Scheduler stores it as EVERY_5_MINUTES + interval N; interval 1 = 5 minutes.
+      // (Kept permissive: the product's picker is fixed at 5, but the record accepts N.)
     }
   }
   let interval = 1;
@@ -832,15 +915,25 @@ const SQA_BROWSERS: Readonly<Record<string, string>> = {
 function sqaBrowser(browser?: string): string {
   if (!browser) return 'CHROME';
   const id = SQA_BROWSERS[browser.trim().toLowerCase()];
-  if (!id) throw new Error(`Unknown browser "${browser}" — use chrome, edge, firefox or safari.`);
-  return id;
+  if (id) return id;
+  // a UI picker key as the Scheduler stores it (CHROME_HEADLESS, FIREFOX_PRIVATE …)
+  try { return pickBrowser(browser, 'LOCAL').key; } catch { /* fall through to the plain message */ }
+  throw new Error(`Unknown browser "${browser}" — use chrome, edge, firefox or safari.`);
+}
+/** A CLOUD run / schedule is headless: the UI's cloud picker offers only Chrome, Firefox and Edge Headless. "chrome" there means Chrome
+ *  Headless; a browser the picker does not offer (Safari …) is refused with the three that exist. */
+export const CLOUD_BROWSER_NAMES = ['Chrome Headless', 'Firefox Headless', 'Edge Headless'] as const;
+function cloudBrowserEntry(browser?: string): { name: string; id: string; technologyType: 'WEB'; type: 'NONE' } {
+  const b = pickBrowser(browser, 'CLOUD');
+  return { name: b.key, id: b.key, technologyType: 'WEB', type: 'NONE' };   // the UI binds key → id AND name
 }
 /** The platform a test case runs on, as the scheduler form derives it from `tcType`: its browser for
  *  WEB, its own technology for API / MAINFRAME / SAP / DESKTOP / DATABASE. Mobile needs a device the
  *  MCP can't pick, so it is refused. */
-function tcPlatform(tc: any, browser?: string): unknown[] {
+function tcPlatform(tc: any, browser?: string, cloud = false): unknown[] {
   const tech = String(tc?.tcType ?? 'WEB').toUpperCase();
   if (tech === 'WEB') {
+    if (cloud) return [cloudBrowserEntry(browser)];
     const b = sqaBrowser(browser);
     return [{ id: b, name: b, type: 'NONE', technologyType: 'WEB' }];
   }
@@ -851,7 +944,7 @@ function tcPlatform(tc: any, browser?: string): unknown[] {
  *  technology among the suite's live test cases (the scheduler keys it by technologyType at run time) —
  *  the browser for WEB, the technology itself for API / MAINFRAME / SAP / DESKTOP / DATABASE. A suite
  *  doc has no platform of its own. Mobile needs a device the MCP can't pick, so it is refused. */
-function suitePlatform(suite: any, browser: string | undefined, verb: string): unknown[] {
+function suitePlatform(suite: any, browser: string | undefined, verb: string, cloud = false): unknown[] {
   const code = suite?.code ?? `SU-${suite?.id}`;
   const rows = (Array.isArray(suite?.testCases) ? suite.testCases : []).filter((r: any) => r && r.deleted !== true);
   if (!rows.length) throw new Error(`${code} has no test cases to run.`);
@@ -860,6 +953,7 @@ function suitePlatform(suite: any, browser: string | undefined, verb: string): u
   if (mobile.length) throw new Error(`${code} has ${mobile.join(' / ')} test cases: ${verb} from SimplifyQA, where you pick the device.`);
   return techs.map((t) => {
     if (t !== 'WEB') return { id: t, name: t, type: 'NONE', technologyType: t };
+    if (cloud) return cloudBrowserEntry(browser);
     const b = sqaBrowser(browser);
     return { id: b, name: b, type: 'NONE', technologyType: 'WEB' };
   });
@@ -1693,7 +1787,7 @@ export class SimplifyQaAdapter {
       : [];
   }
 
-  /** `GET /pm/auth/me` → `{ userDetails: { id, username, email, … }, userPreference, … }`.
+/** `GET /pm/auth/me` → `{ userDetails: { id, username, email, … }, userPreference, … }`.
    *  Only `userDetails.id` is read: the payload also carries an agent token and the full
    *  preference/privilege set, which must never be logged or persisted. */
   private async fetchUserIdFromMe(): Promise<string | undefined> {
@@ -2455,6 +2549,86 @@ export class SimplifyQaAdapter {
     };
   }
 
+  /** A value of the defect form's Environment / Type (Execution Type) dropdown. The project's own list wins when it defines one; the form
+   *  otherwise offers a fixed list (Development / QA / UAT, Manual / Automation). A value outside it is refused with the valid ones. */
+  private async defectChoice(key: 'environment' | 'executionType', want: string): Promise<string> {
+    const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const fixed: Record<typeof key, string[]> = { environment: ['Development', 'QA', 'UAT'], executionType: ['Manual', 'Automation'] };
+    const project = await this.defaultFieldValues(9, key);
+    const values = project.length ? project : fixed[key].map((v) => ({ key: v, value: v }));
+    const hit = values.find((v) => canon(v.key) === canon(want) || canon(v.value) === canon(want));
+    if (!hit) {
+      throw new Error(`"${want}" is not a defect ${key === 'executionType' ? 'type (execution type)' : key} in this project. Valid: ${values.map((v) => v.key).join(', ')}.`);
+    }
+    return hit.key;
+  }
+
+  /** A planned date of the defect form as the backend takes it (a date); only YYYY-MM-DD is accepted so a typo is not guessed at. */
+  private defectDate(label: string, v: string): string {
+    const day = String(v).trim().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(new Date(`${day}T00:00:00Z`).getTime())) {
+      throw new Error(`${label} must be a date like 2026-11-20 (got "${v}").`);
+    }
+    return `${day}T00:00:00.000Z`;
+  }
+
+  /** The form's Feature field: a feature of THIS project, by id, business key (FT-248) or exact name. */
+  private async resolveDefectFeature(ref: string): Promise<{ id: number; label: string }> {
+    const projectId = this.requireProjectId();
+    const raw = String(ref).trim();
+    const attempts: Array<{ column: string; value: string | number }> = [];
+    if (/^\d+$/.test(raw)) attempts.push({ column: 'id', value: Number.parseInt(raw, 10) });
+    for (const c of SimplifyQaAdapter.codeVariants(raw)) attempts.push({ column: 'code', value: c });
+    attempts.push({ column: 'name', value: raw });
+    for (const a of attempts) {
+      const res = await this.http.postJson<any>('/pm/feature/search', this.searchBody(
+        [{ column: 'projectIds', value: projectId }, { column: a.column, value: a.value }],
+        { startIndex: 0, limit: 5, selectFields: ['id', 'code', 'name'] },
+      ));
+      const hit = pickArray(res, 'data', 'content', 'features').find((r: any) =>
+        a.column === 'id' ? String(str(r, 'id', '_id')) === String(a.value) : String(str(r, a.column) ?? '').toLowerCase() === String(a.value).toLowerCase());
+      const id = hit ? Number.parseInt(str(hit, 'id', '_id') ?? '', 10) : NaN;
+      if (Number.isFinite(id)) return { id, label: [str(hit, 'code'), str(hit, 'name')].filter(Boolean).join(' ') || String(id) };
+    }
+    throw new Error(`No feature "${ref}" in this project. Pass its id, business key (e.g. FT-248) or exact name.`);
+  }
+
+  /** The extra form fields of a create / update, checked and turned into the wire fields — before anything is written, so one bad value
+   *  refuses the whole call. `clearable` (update): 'none' empties a field. `before` carries the dates already on the defect so that a
+   *  new end date is compared with the stored start date and the other way round. */
+  private async defectFormFields(input: DefectFormExtras, clearable: boolean, before: Record<string, any> = {}): Promise<{
+    wire: Record<string, unknown>; labels: Record<string, string>;
+  }> {
+    const wire: Record<string, unknown> = {};
+    const labels: Record<string, string> = {};
+    const isNone = (v: string): boolean => clearable && v.trim().toLowerCase() === 'none';
+    for (const key of ['environment', 'executionType'] as const) {
+      const want = input[key];
+      if (want === undefined) continue;
+      if (isNone(want)) { wire[key] = ''; labels[key] = 'none'; continue; }
+      const v = await this.defectChoice(key, want);
+      wire[key] = v; labels[key] = v;
+    }
+    if (input.featureId !== undefined) {
+      if (isNone(input.featureId)) { wire['featureId'] = null; labels['featureId'] = 'none'; }
+      else { const f = await this.resolveDefectFeature(input.featureId); wire['featureId'] = f.id; labels['featureId'] = f.label; }
+    }
+    for (const [key, label] of [['plannedStartDate', 'Planned start date'], ['plannedEndDate', 'Planned end date']] as const) {
+      const want = input[key];
+      if (want === undefined) continue;
+      if (isNone(want)) { wire[key] = null; labels[key] = 'none'; continue; }
+      wire[key] = this.defectDate(label, want);
+      labels[key] = String(wire[key]).slice(0, 10);
+    }
+    const day = (k: 'plannedStartDate' | 'plannedEndDate'): string | undefined => {
+      const v = k in wire ? wire[k] : before[k];
+      return v ? String(v).slice(0, 10) : undefined;
+    };
+    const [start, end] = [day('plannedStartDate'), day('plannedEndDate')];
+    if (start && end && end < start) throw new Error(`Planned end date (${end}) must be on or after the planned start date (${start}).`);
+    return { wire, labels };
+  }
+
   /** Change a defect the way the SimplifyQA defect form does (a partial `PUT /pm/defect/:id` carrying the project and the version it
    *  read), then read it back. USER STORY is `userstoryId`; TEST CASE is `selectedTestCase` — entries with the test case's id, code,
    *  name and chosen version — which the backend also writes onto the test case's own linked-defects list; that last step swallows its
@@ -2486,6 +2660,15 @@ export class SimplifyQaAdapter {
         v = hit.key;
       }
       if (v !== doc[key]) change(key, key, v, String(doc[key] ?? '(none)'), v);
+    }
+    // Environment, Type (execution type), Feature, planned dates
+    const extra = await this.defectFormFields(patch, true, doc);
+    const FORM_LABELS: Record<string, string> = { environment: 'environment', executionType: 'type', featureId: 'feature', plannedStartDate: 'planned start date', plannedEndDate: 'planned end date' };
+    for (const [key, to] of Object.entries(extra.wire)) {
+      const dateKey = key === 'plannedStartDate' || key === 'plannedEndDate';
+      const was = dateKey ? String(doc[key] ?? '').slice(0, 10) : String(doc[key] ?? '');
+      const now = dateKey ? String(to ?? '').slice(0, 10) : String(to ?? '');
+      if (was !== now) change(FORM_LABELS[key] ?? key, key, to, was || '(none)', extra.labels[key] ?? now);
     }
     if (patch.name !== undefined && patch.name.trim() !== name) {
       if (patch.name.trim().length < 3) throw new Error('A defect name needs at least 3 characters.');
@@ -2572,38 +2755,45 @@ export class SimplifyQaAdapter {
       }
     }
 
-    if (!shown.length) return { id: String(defectId), code, name, changes: [], written: false, warnings };
+    const wantLinks = patch.linkages ?? [];
+    if (!shown.length && !wantLinks.length) return { id: String(defectId), code, name, changes: [], written: false, warnings };
 
-    // save (a stale version is retried once with the fresh one)
-    const send = (d: Record<string, any>): Promise<unknown> =>
-      this.http.putJson<any>(`/pm/defect/${defectId}`, { projectId, updateVersion: typeof d['updateVersion'] === 'number' ? d['updateVersion'] : 0, ...changes });
-    try {
+    let nameNow = name;
+    if (shown.length) {
+      // save (a stale version is retried once with the fresh one)
+      const send = (d: Record<string, any>): Promise<unknown> =>
+        this.http.putJson<any>(`/pm/defect/${defectId}`, { projectId, updateVersion: typeof d['updateVersion'] === 'number' ? d['updateVersion'] : 0, ...changes });
       try {
-        await send(doc);
+        try {
+          await send(doc);
+        } catch (e) {
+          if (!/CONCURRENCY/i.test(e instanceof Error ? e.message : String(e))) throw e;
+          await send((await this.readDefectDoc(defectId)) ?? doc);
+        }
       } catch (e) {
-        if (!/CONCURRENCY/i.test(e instanceof Error ? e.message : String(e))) throw e;
-        await send((await this.readDefectDoc(defectId)) ?? doc);
+        const m = e instanceof Error ? e.message : String(e);
+        if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+          throw new Error(`Updating a defect needs the "add_defect" privilege in this project, and the connected user does not have it (${m}).`);
+        }
+        throw e;
       }
-    } catch (e) {
-      const m = e instanceof Error ? e.message : String(e);
-      if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
-        throw new Error(`Updating a defect needs the "add_defect" privilege in this project, and the connected user does not have it (${m}).`);
-      }
-      throw e;
-    }
 
-    // read the defect back and compare
-    const after = await this.readDefectDoc(defectId);
-    if (!after) throw new Error(`${code} was updated but could not be read back.`);
-    for (const k of Object.keys(changes)) {
-      const want = changes[k];
-      const got = after[k];
-      const same = k === 'ownerId'
-        ? JSON.stringify([...(Array.isArray(got) ? got : [])].map(Number).sort()) === JSON.stringify([...(want as number[])].sort())
-        : k === 'selectedTestCase'
-          ? sig(Array.isArray(got) ? got : []) === sig(want as any[])
-          : String(got ?? '') === String(want ?? '');
-      if (!same) throw new Error(`${code}: "${k}" was sent as ${JSON.stringify(want).slice(0, 200)} but reads back as ${JSON.stringify(got).slice(0, 200)}.`);
+      // read the defect back and compare
+      const after = await this.readDefectDoc(defectId);
+      if (!after) throw new Error(`${code} was updated but could not be read back.`);
+      for (const k of Object.keys(changes)) {
+        const want = changes[k];
+        const got = after[k];
+        const same = k === 'ownerId'
+          ? JSON.stringify([...(Array.isArray(got) ? got : [])].map(Number).sort()) === JSON.stringify([...(want as number[])].sort())
+          : k === 'plannedStartDate' || k === 'plannedEndDate'
+            ? String(got ?? '').slice(0, 10) === String(want ?? '').slice(0, 10)
+            : k === 'selectedTestCase'
+              ? sig(Array.isArray(got) ? got : []) === sig(want as any[])
+              : String(got ?? '') === String(want ?? '');
+        if (!same) throw new Error(`${code}: "${k}" was sent as ${JSON.stringify(want).slice(0, 200)} but reads back as ${JSON.stringify(got).slice(0, 200)}.`);
+      }
+      nameNow = String(after['name'] ?? name);
     }
 
     // the test case's own linked-defects list is written by the backend with its failures swallowed — check it, repair it, re-check
@@ -2620,7 +2810,16 @@ export class SimplifyQaAdapter {
       }
       if (!state.ok) warnings.push(`${t.label}: the defect is saved with the test case, but the test case's own linked-defects list does not show ${code}.`);
     }
-    return { id: String(defectId), code, name: String(after['name'] ?? name), changes: shown, written: true, warnings };
+
+    // Linkages, saved from the DEFECT's side (each is read back from /pm/linkages inside linkBacklogItem)
+    let linksAdded = 0;
+    for (const l of wantLinks) {
+      const r = await this.linkBacklogItem({ sourceType: 'defect', sourceId: String(defectId), destType: l.destType, destId: l.destId, linkType: l.linkType });
+      const to = `${r.destinationCode ?? l.destId} (${l.linkType})`;
+      if (r.alreadyLinked) warnings.push(`${code} was already linked to ${to} — left as it is.`);
+      else { shown.push({ field: 'linkage', from: '(none)', to }); linksAdded++; }
+    }
+    return { id: String(defectId), code, name: nameNow, changes: shown, written: shown.length > linksAdded || linksAdded > 0, warnings };
   }
 
   // ---------------------------------------------------------------------- Defect create
@@ -2695,8 +2894,12 @@ export class SimplifyQaAdapter {
     else moduleId = await this.resolveModuleId('Default module').catch(() => undefined);
     if (moduleId !== undefined && !Number.isFinite(moduleId)) moduleId = undefined;
 
+    // Environment, Type (execution type), Feature, planned dates — checked now, before anything is created
+    const extra = await this.defectFormFields(input, false);
+
     const body: Record<string, unknown> = {
       projectId, name, state, priority, description: input.description ?? '',
+      ...extra.wire,
       ...(severity ? { severity } : {}), ...(category ? { category } : {}),
       ...(ownerId ? { ownerId } : {}),
       ...(plan.releaseId != null ? { releaseId: plan.releaseId } : {}), ...(plan.iterationId != null ? { iterationId: plan.iterationId } : {}),
@@ -2732,10 +2935,31 @@ export class SimplifyQaAdapter {
         warnings.push(`${t.label}: the defect is saved with the test case, but the test case's own linked-defects list does not show ${defectCode}.`);
       }
     }
+    // the extra form fields as stored (a mismatch is reported, never hidden — the defect exists by now)
+    const fields: string[] = [];
+    const FIELD_NAMES: Record<string, string> = { environment: 'environment', executionType: 'type', featureId: 'feature', plannedStartDate: 'planned start', plannedEndDate: 'planned end' };
+    for (const [key, sent] of Object.entries(extra.wire)) {
+      const dateKey = key === 'plannedStartDate' || key === 'plannedEndDate';
+      const got = dateKey ? String(doc[key] ?? '').slice(0, 10) : String(doc[key] ?? '');
+      const want = dateKey ? String(sent ?? '').slice(0, 10) : String(sent ?? '');
+      if (got === want) fields.push(`${FIELD_NAMES[key] ?? key} ${extra.labels[key] ?? got}`);
+      else warnings.push(`${defectCode}: ${FIELD_NAMES[key] ?? key} was sent as ${want || 'empty'} but reads back as ${got || 'empty'}.`);
+    }
+    // Linkages, saved from the new defect's side; a failed one is reported with its reason while the defect stays logged
+    const linked: string[] = [];
+    for (const l of input.linkages ?? []) {
+      try {
+        const r = await this.linkBacklogItem({ sourceType: 'defect', sourceId: String(defectId), destType: l.destType, destId: l.destId, linkType: l.linkType });
+        linked.push(`${r.destinationCode ?? l.destId} (${l.linkType})`);
+      } catch (e) {
+        warnings.push(`${defectCode} was logged, but linking it to ${l.destType} ${l.destId} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     return {
       defectId: String(defectId), defectCode, name, state: String(doc['state'] ?? state ?? ''), priority: String(doc['priority'] ?? priority ?? ''),
       ...(severity ? { severity: String(doc['severity'] ?? severity) } : {}), testCases: tcEntries.map((t) => t.label),
-      ...(userstoryId !== undefined ? { storyId: userstoryId } : {}), defaults, warnings,
+      ...(userstoryId !== undefined ? { storyId: userstoryId } : {}),
+      ...(fields.length ? { fields } : {}), ...(linked.length ? { linked } : {}), defaults, warnings,
     };
   }
 
@@ -3127,12 +3351,13 @@ export class SimplifyQaAdapter {
    *  `userstoryObj` + `filename1`), so this re-saves the item with its existing fields + attachments
    *  and the new file. Reads the attachments back and returns them. */
   async addAttachment(input: {
-    entityType: 'epic' | 'feature' | 'userstory';
+    entityType: AttachmentEntity;
     itemId: string;
     fileName: string;
     contentType?: string | undefined;
     data: Uint8Array;
   }): Promise<{ id?: string; name: string; attachments: Array<Record<string, unknown>> }> {
+    if (input.entityType === 'defect') return this.addDefectAttachment(input);
     const spec = BACKLOG_ATTACHMENT_SPECS[input.entityType];
     const numeric = input.entityType === 'epic' ? await this.resolveEpicNumericId(input.itemId)
       : input.entityType === 'feature' ? await this.resolveFeatureNumericId(input.itemId)
@@ -3167,8 +3392,69 @@ export class SimplifyQaAdapter {
     return { ...(doc['id'] !== undefined ? { id: String(doc['id']) } : {}), name: input.fileName, attachments };
   }
 
-  /** Attachments of an epic / feature / user story (`/pm/attachment/:id/:parentType`). */
-  async entityAttachments(entityType: 'epic' | 'feature' | 'userstory', id: string): Promise<Array<Record<string, unknown>>> {
+  /** Attach a file to a DEFECT: the defect's own update with the file as the multipart `filename1` part and ONLY the project and version
+   *  as fields — a defect update takes just what changes, and its existing attachments are left alone. Read back from `/pm/attachment/:id/DE`. */
+  private async addDefectAttachment(input: { itemId: string; fileName: string; contentType?: string | undefined; data: Uint8Array }): Promise<{ id?: string; name: string; attachments: Array<Record<string, unknown>> }> {
+    if (!this.http.putMultipartWithFiles) throw new Error('This connection cannot upload attachments.');
+    const projectId = this.requireProjectId();
+    let doc = await this.findDefectDoc(input.itemId);
+    const id = String(doc['id']);
+    const send = (d: Record<string, any>): Promise<unknown> => this.http.putMultipartWithFiles!(
+      `/pm/defect/${id}`, 'defectObj', { projectId, updateVersion: typeof d['updateVersion'] === 'number' ? d['updateVersion'] : 0 },
+      [{ partName: 'filename1', fileName: input.fileName, ...(input.contentType ? { contentType: input.contentType } : {}), data: input.data }],
+    );
+    try {
+      try {
+        await send(doc);
+      } catch (e) {
+        if (!/CONCURRENCY/i.test(e instanceof Error ? e.message : String(e))) throw e;
+        doc = (await this.readDefectDoc(Number(id))) ?? doc;
+        await send(doc);
+      }
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+        throw new Error(`Attaching a file to a defect needs the "add_defect" privilege in this project, and the connected user does not have it (${m}).`);
+      }
+      throw e;
+    }
+    const attachments = await this.entityAttachments('defect', id);
+    if (!attachments.some((a) => String(a['original_name'] ?? a['name'] ?? '') === input.fileName)) {
+      throw new Error(
+        `Uploaded "${input.fileName}" to defect ${input.itemId}, but reading the attachments back did not find it. ` +
+        `Attachments now: ${attachments.map((a) => String(a['original_name'] ?? a['name'] ?? '')).join(', ') || '(none)'}`,
+      );
+    }
+    return { id, name: input.fileName, attachments };
+  }
+
+  /** Remove one attachment from a DEFECT: the update's `attachments` names the rows to delete — the row with `deleted:true` and the project
+   *  (the backend scopes the delete by it). Read back to confirm it is gone. */
+  private async removeDefectAttachment(input: { itemId: string; attachment: string }): Promise<{ removed: boolean; attachments: Array<Record<string, unknown>> }> {
+    if (!this.http.putMultipart) throw new Error('This connection cannot update attachments.');
+    const projectId = this.requireProjectId();
+    const doc = await this.findDefectDoc(input.itemId);
+    const id = String(doc['id']);
+    const rows = await this.entityAttachments('defect', id);
+    const wanted = input.attachment.trim();
+    const match = rows.find((a) => String(a['id']) === wanted || String(a['original_name'] ?? a['name'] ?? '') === wanted);
+    if (!match) {
+      throw new Error(`No attachment "${input.attachment}" on defect ${input.itemId}. Attachments: ${rows.map((a) => String(a['original_name'] ?? a['name'] ?? a['id'])).join(', ') || '(none)'}`);
+    }
+    const row = { ...match, deleted: true, projectId };
+    delete (row as Record<string, unknown>)['file'];
+    await this.http.putMultipart(`/pm/defect/${id}`, 'defectObj', {
+      projectId, updateVersion: typeof doc['updateVersion'] === 'number' ? doc['updateVersion'] : 0, attachments: [row],
+    });
+    const attachments = await this.entityAttachments('defect', id);
+    if (attachments.some((a) => String(a['id']) === String(match['id']))) {
+      throw new Error(`Tried to delete "${input.attachment}" but it is still listed after the save.`);
+    }
+    return { removed: true, attachments };
+  }
+
+  /** Attachments of an epic / feature / user story / defect (`/pm/attachment/:id/:parentType`). */
+  async entityAttachments(entityType: AttachmentEntity, id: string): Promise<Array<Record<string, unknown>>> {
     const spec = BACKLOG_ATTACHMENT_SPECS[entityType];
     const projectId = this.requireProjectId();
     const raw = await this.http.getJson<any>(`/pm/attachment/${numericId(id)}/${spec.parentType}?projectId=${projectId}`);
@@ -3182,7 +3468,7 @@ export class SimplifyQaAdapter {
    *  (`needsChoice`) so the caller can ask. Each saved file is compared with the size SimplifyQA reports, and a web page standing in for the file
    *  (an expired login) is refused rather than saved as a "download". Never overwrites: a name that exists gets " (1)". */
   async downloadAttachments(input: {
-    entityType: 'epic' | 'feature' | 'userstory';
+    entityType: AttachmentEntity;
     itemId: string;
     attachments?: string[] | undefined;
     all?: boolean | undefined;
@@ -3190,7 +3476,7 @@ export class SimplifyQaAdapter {
   }): Promise<AttachmentDownloadResult> {
     if (!this.http.getBinary) throw new Error('This connection cannot download files.');
     const base = (this.cfg.baseUrl ?? '').replace(/\/+$/, '');
-    const rows = await this.entityAttachments(input.entityType, input.itemId);
+    const rows = await this.entityAttachments(input.entityType, input.entityType === 'defect' ? String((await this.findDefectDoc(input.itemId))['id']) : input.itemId);
     const nameOf = (a: Record<string, unknown>): string => String(a['original_name'] ?? a['name'] ?? '').trim();
     const sizeOf = (a: Record<string, unknown>): number | undefined => {
       const n = typeof a['size'] === 'number' ? (a['size'] as number) : Number(a['size'] ?? a['fileSize']);
@@ -3257,10 +3543,11 @@ export class SimplifyQaAdapter {
   /** Remove one attachment (by id or stored/original name) from an epic / feature / user story.
    *  Mirrors the UI: mark the row `deleted:true` and re-save the item (multipart, no file part). */
   async removeAttachment(input: {
-    entityType: 'epic' | 'feature' | 'userstory';
+    entityType: AttachmentEntity;
     itemId: string;
     attachment: string;
   }): Promise<{ removed: boolean; attachments: Array<Record<string, unknown>> }> {
+    if (input.entityType === 'defect') return this.removeDefectAttachment(input);
     const spec = BACKLOG_ATTACHMENT_SPECS[input.entityType];
     const numeric = input.entityType === 'epic' ? await this.resolveEpicNumericId(input.itemId)
       : input.entityType === 'feature' ? await this.resolveFeatureNumericId(input.itemId)
@@ -3962,6 +4249,60 @@ export class SimplifyQaAdapter {
     return { id, code, name: String(after.name ?? row.name ?? ''), stateBefore, stateAfter: String(after.state ?? ''), changed: changes, warnings, written: true };
   }
 
+  /** Everything that still uses a release / sprint, found by the MCP itself (nothing is written). A lookup that FAILS
+   *  stops the whole preview — "could not check" must never read as "nothing uses it". */
+  async releaseOrSprintDeletePreview(kind: 'release' | 'sprint', ref: string): Promise<PmDeletePreview> {
+    const row = await this.findPm(kind, ref);
+    const n = Number(row.id);
+    const column = kind === 'release' ? 'releaseId' : 'iterationId';
+    const where = async (label: string, path: string): Promise<SuiteRef[]> => {
+      try {
+        const raw = await this.http.postJson<any>(path, this.searchBody([{ column, value: n }], { selectFields: ['id', 'code', 'name'], limit: 100 }));
+        return pickArray(raw, 'data', 'content').map(toRef);
+      } catch (e) {
+        throw new Error(`Could not check the ${label} that use ${row.code ?? `#${n}`} (${e instanceof Error ? e.message : String(e)}). Nothing was deleted.`);
+      }
+    };
+    const [stories, defects, tasks, executionPlans, pipelines, schedules] = await Promise.all([
+      where('stories', '/pm/userstory/search'), where('defects', '/pm/defect/search'), where('tasks', '/pm/task/search'),
+      where('execution plans', '/tm/executionplan/search'), where('pipelines', '/pl/pipelines/search'), where('schedules', '/sh/scheduler/search'),
+    ]);
+    const sprints = kind === 'release'
+      ? (await this.pmRows('sprint')).filter((s) => String(s?.releaseId) === String(n)).map(toRef)
+      : [];
+    // A release can belong to several projects, and deleting it removes it from all of them.
+    const projectId = this.requireProjectId();
+    const otherIds = kind === 'release' && Array.isArray(row.projectIds)
+      ? row.projectIds.map(Number).filter((p: number) => Number.isFinite(p) && String(p) !== String(projectId))
+      : [];
+    const otherProjects = otherIds.length ? await this.refsByIds('/pm/project/search', otherIds) : [];
+    return {
+      kind,
+      record: { ...toRef(row), ...(row.state ? { state: String(row.state) } : {}) },
+      blockers: { sprints, stories, defects, tasks, executionPlans, pipelines, schedules, otherProjects },
+      callerIsAdmin: await this.isCallerAdmin(),
+    };
+  }
+
+  /** Delete a release / sprint (`PATCH /pm/release|sprint { id:[n] }` — admin only) — only when nothing uses it, and proven by
+   *  re-reading: SimplifyQA answers 201 whether or not the row was found. */
+  async deleteReleaseOrSprint(kind: 'release' | 'sprint', ref: string): Promise<SuiteRef> {
+    const { record, blockers } = await this.releaseOrSprintDeletePreview(kind, ref);
+    if (Object.values(blockers).some((b) => b.length)) throw new PmBlockedError(kind, record, blockers);
+    try {
+      await this.http.patchJson<any>(`/pm/${kind}`, { id: [Number(record.id)] });
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/INVALIDUSERTYPE|admin privileges|not.*authori[sz]ed|forbidden|\b40[13]\b/i.test(m)) {
+        throw new Error(`Deleting a ${kind} needs an admin user in SimplifyQA, and the connected user is not one (${m}). Nothing was deleted.`);
+      }
+      throw e;
+    }
+    const still = (await this.pmRows(kind)).some((r) => String(r.id) === record.id);
+    if (still) throw new Error(`SimplifyQA answered OK but ${record.code ?? record.id} is still listed — nothing was deleted.`);
+    return record;
+  }
+
   /** Create a release or a sprint the way Releases → Create does (`POST /pm/release` / `/pm/sprint`), then read it back.
    *  The backend requires a state and at least one owner, so the state defaults to the project's first one (New) and the owner to
    *  the connected user. A sprint needs an existing release of this project. */
@@ -4214,12 +4555,12 @@ export class SimplifyQaAdapter {
    *  chosen LINK TYPE — the UI's Linkages section. The link is stored in the source item's
    *  `linkedIssues` array (the same field the form saves) and read back from /pm/linkages. */
   async linkBacklogItem(input: {
-    sourceType: 'epic' | 'feature' | 'userstory';
+    sourceType: 'epic' | 'feature' | 'userstory' | 'defect';
     sourceId: string;
     destType: 'epic' | 'feature' | 'userstory' | 'defect' | 'task';
     destId: string;
     linkType: string;
-  }): Promise<{ linkTypeKey: string; destinationCode?: string; linkedIssues: Array<Record<string, unknown>> }> {
+  }): Promise<{ linkTypeKey: string; destinationCode?: string; linkedIssues: Array<Record<string, unknown>>; alreadyLinked?: boolean }> {
     const specs = {
       epic: { path: '/pm/epic', search: '/pm/epic/search', collection: 'epic', parentType: 'EP' },
       feature: { path: '/pm/feature', search: '/pm/feature/search', collection: 'feature', parentType: 'FT' },
@@ -4290,16 +4631,47 @@ export class SimplifyQaAdapter {
       jiraLinkId: '',
     };
 
-    const sourceRaw = asDoc(await this.http.getJson<any>(`${specs[input.sourceType].path}/${source.id}`));
-    const existing = Array.isArray(sourceRaw['linkedIssues']) ? (sourceRaw['linkedIssues'] as Array<Record<string, unknown>>) : [];
-    const merged = [
-      ...existing.filter((e) => !(Number(e['destinationId']) === dest.id && String(e['linkTypeKey']) === chosen.key)),
-      entry,
-    ];
-    const version = typeof sourceRaw['updateVersion'] === 'number' ? sourceRaw['updateVersion'] : 0;
-    if (input.sourceType === 'epic') await this.updateEpic(String(source.id), { linkedIssues: merged, updateVersion: version });
-    else if (input.sourceType === 'feature') await this.updateFeature(String(source.id), { linkedIssues: merged, updateVersion: version });
-    else await this.updateStory(String(source.id), { linkedIssues: merged });
+    const readLinks = async (): Promise<Array<Record<string, unknown>>> => {
+      const rawLinks = await this.http.getJson<any>(`/pm/linkages/${source.id}/${specs[input.sourceType].parentType}?projectId=${projectId}`);
+      return (Array.isArray(rawLinks) ? rawLinks : pickArray(rawLinks, 'data', 'content', 'linkages')) as Array<Record<string, unknown>>;
+    };
+    if (input.sourceType === 'defect') {
+      // A defect's save ADDS the rows that carry no id and leaves the others alone, and its document does not echo its links — so only the
+      // new row is sent, and only when this exact link (same item, same type) is not already there.
+      const present = await readLinks();
+      if (present.some((l) => Number(l['destinationId']) === dest.id && String(l['linkTypeKey']) === chosen.key)) {
+        return { linkTypeKey: chosen.key, ...(dest.code ? { destinationCode: dest.code } : {}), linkedIssues: present, alreadyLinked: true };
+      }
+      const sendLink = async (): Promise<unknown> => {
+        const d = await this.readDefectDoc(source.id);
+        return this.http.putJson<any>(`/pm/defect/${source.id}`, { projectId, updateVersion: typeof d?.['updateVersion'] === 'number' ? d['updateVersion'] : 0, linkedIssues: [entry] });
+      };
+      try {
+        try {
+          await sendLink();
+        } catch (e) {
+          if (!/CONCURRENCY/i.test(e instanceof Error ? e.message : String(e))) throw e;
+          await sendLink();
+        }
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        if (/INVALIDTOKEN|Don't Have Privileges|privilege/i.test(m)) {
+          throw new Error(`Linking from a defect needs the "add_defect" privilege in this project, and the connected user does not have it (${m}).`);
+        }
+        throw e;
+      }
+    } else {
+      const sourceRaw = asDoc(await this.http.getJson<any>(`${specs[input.sourceType].path}/${source.id}`));
+      const existing = Array.isArray(sourceRaw['linkedIssues']) ? (sourceRaw['linkedIssues'] as Array<Record<string, unknown>>) : [];
+      const merged = [
+        ...existing.filter((e) => !(Number(e['destinationId']) === dest.id && String(e['linkTypeKey']) === chosen.key)),
+        entry,
+      ];
+      const version = typeof sourceRaw['updateVersion'] === 'number' ? sourceRaw['updateVersion'] : 0;
+      if (input.sourceType === 'epic') await this.updateEpic(String(source.id), { linkedIssues: merged, updateVersion: version });
+      else if (input.sourceType === 'feature') await this.updateFeature(String(source.id), { linkedIssues: merged, updateVersion: version });
+      else await this.updateStory(String(source.id), { linkedIssues: merged });
+    }
 
     // Confirm from the linkages sub-resource (the item document does not echo the array).
     const rawLinks = await this.http.getJson<any>(`/pm/linkages/${source.id}/${specs[input.sourceType].parentType}?projectId=${projectId}`);
@@ -4448,11 +4820,30 @@ export class SimplifyQaAdapter {
    *  failed step only when this is on AND the suite / execution plan has autoDefectLog set — the UI
    *  refuses the suite/plan toggle while it is off. `undefined` = could not be read (no access): callers
    *  must then not block. */
-  async autoDefectLogStatus(): Promise<{ adminEnabled: boolean } | undefined> {
+  /** What a CLOUD run's browser question offers: the UI's cloud picker (headless only). */
+  cloudBrowserOptions(): string[] {
+    return [...CLOUD_BROWSER_NAMES];
+  }
+
+  async autoDefectLogStatus(): Promise<{ adminEnabled: boolean; configMissing: string[] } | undefined> {
     try {
       const project = await this.getProjectById(String(this.requireProjectId()));
-      const flag = project?.['generalSettings']?.['defectManagement']?.['autoDefectFlag'];
-      return { adminEnabled: flag === true };
+      const dm = project?.['generalSettings']?.['defectManagement'];
+      // the backend builds the defect from this config (owner, priority, state); without them the defect is not created
+      const cfg = dm?.['configAutologgedDefect'] ?? {};
+      const missing = [['assignee', cfg['assigneeId']], ['priority', cfg['priority']], ['state', cfg['state'] ?? cfg['status']]]
+        .filter(([, v]) => v === undefined || v === null || v === '').map(([k]) => String(k));
+      return { adminEnabled: dm?.['autoDefectFlag'] === true, configMissing: missing };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The suite's / execution plan's own Auto Defect Logging flag (what its Settings panel shows), or undefined when it cannot be read. */
+  async autoDefectLogOf(kind: 'suite' | 'plan', id: string): Promise<boolean | undefined> {
+    try {
+      const raw = kind === 'suite' ? await this.readOwnSuite(id) : await this.readOwnPlan(id);
+      return raw['autoDefectLog'] === true;
     } catch {
       return undefined;
     }
@@ -6691,6 +7082,10 @@ export class SimplifyQaAdapter {
       // The catalog can miss a project's newer custom actions, so look the id / name / display name up
       // directly with a targeted search (never GET /tm/action/:id — that route reads the id as a project id).
       let fallbackDiag = '';
+      // An EXISTING step whose action still cannot be found (a custom method from another catalogue, a
+      // row the search is not allowed to read) must round-trip untouched instead of failing the whole
+      // edit: keep the action id it was saved with. Only a NEW step is refused when it cannot resolve.
+      let preserveAction = false;
       if (!meta) {
         try {
           meta = await this.findActionLive(name);
@@ -6701,13 +7096,16 @@ export class SimplifyQaAdapter {
           catalog.set(`id::${meta.id}`, meta);
           if (meta.name) catalog.set(meta.name.toLowerCase(), meta);
           if (meta.displayName) catalog.set(`dis::${meta.displayName.toLowerCase()}`, meta);
+        } else if (isNumericId && s.sourceId) {
+          meta = { id: Number.parseInt(name, 10), objectRequired: false };
+          preserveAction = true;
         }
       }
       if (!meta) {
         throw new Error(`Automation step ${i + 1}: the action "${name}" was not found in the action list for technology ${tech} (project ${projectId}). Check the action id, method name or display name.${fallbackDiag} [catalog: ${this.actionCatalogFetchDiag}]`);
       }
-      let objectId: number | null | undefined = null;
-      if (meta.objectRequired) {
+      let objectId: number | null | undefined = preserveAction ? undefined : null;
+      if (!preserveAction && meta.objectRequired) {
         // Resolution ladder (first match wins):
         //   1. objectRef.id set → use directly (round-trip OR LLM referencing a known object)
         //   2. sourceId set but no objectRef.id → preserve DB value (existing step, backend may
@@ -6985,8 +7383,17 @@ export class SimplifyQaAdapter {
       const tcNum = numericId(String(op.tcId));
       switch (op.op) {
         case 'add': {
-          const already = members.some((m) => String(m['testcaseId']) === tcNum);
-          if (!already) members.push(await this.buildSuiteEntryFromTestcase(tcNum));
+          // The same test case may legitimately appear once PER VERSION — dedupe on (tc, version),
+          // never on the tc alone, or asking for v2.0 after v1.0 silently keeps v1.0.
+          const wantsVersion = !!(op.versionId || op.version);
+          if (!wantsVersion && members.some((m) => String(m['testcaseId']) === tcNum)) break;
+          const entry = await this.buildSuiteEntryFromTestcase(tcNum, {
+            ...(op.versionId ? { versionId: op.versionId } : {}),
+            ...(op.version ? { version: op.version } : {}),
+          });
+          const dup = members.some((m) => String(m['testcaseId']) === tcNum
+            && String(m['versionId'] ?? '') === String(entry['versionId'] ?? ''));
+          if (!dup) members.push(entry);
           break;
         }
         case 'remove': {
@@ -7094,7 +7501,8 @@ export class SimplifyQaAdapter {
     const raw = await this.readOwnSuite(id);
     const payload: Record<string, unknown> = {
       id: raw['id'], suiteType: raw['suiteType'], projectId: raw['projectId'],
-      autoReExecTriggerOn: raw['autoReExecTriggerOn'], autoReExecCount: raw['autoReExecCount'],
+      // the settings validator requires both; a suite saved without them would otherwise fail on any settings change
+      autoReExecTriggerOn: raw['autoReExecTriggerOn'] ?? 'AFTER_SUITE', autoReExecCount: raw['autoReExecCount'] ?? 0,
     };
     for (const k of SUITE_SETTING_KEYS) if (settings[k] !== undefined) payload[k] = settings[k];
     if (raw['updateVersion'] !== undefined) payload['updateVersion'] = raw['updateVersion'];
@@ -7224,7 +7632,12 @@ export class SimplifyQaAdapter {
     const candidates: Array<{ raw: any; versionId: string; versionName: string; platform: unknown; source: Record<string, unknown> }> = [];
     for (const tcId of input.tcIds ?? []) {
       const raw = await this.readOwnTestcase(tcId);
-      const v = testcaseVersion(raw);
+      const v = pickTestcaseVersion(raw, input.versionId, input.version);
+      candidates.push({ raw, ...v, platform: entryPlatform(raw.executionPlatform), source: { sourceType: 'testcase', sourceId: 0 } });
+    }
+    for (const spec of input.testCases ?? []) {
+      const raw = await this.readOwnTestcase(spec.tcId);
+      const v = pickTestcaseVersion(raw, spec.versionId, spec.version);
       candidates.push({ raw, ...v, platform: entryPlatform(raw.executionPlatform), source: { sourceType: 'testcase', sourceId: 0 } });
     }
     for (const suiteId of input.suiteIds ?? []) {
@@ -7245,15 +7658,27 @@ export class SimplifyQaAdapter {
 
     const existing = await this.listPlanEntries(Number(plan['id']));
     let seq = existing.reduce((m: number, e: any) => Math.max(m, Number(e?.seq) || 0), 0);
-    const seen = new Set(existing.map((e: any) => `${Number(e?.testcaseId)}|${e?.expAssignedTo ?? null}`));
+    // Dedupe on (test case, VERSION, assignee): a plan may legitimately hold v1.0 and v2.0 of one TC.
+    // An older entry that stores no version at all is treated as "this test case is already in" (we
+    // cannot prove which version, so adding another would risk an invisible duplicate).
+    const seenExact = new Set(existing
+      .filter((e: any) => e?.tcVersionId)
+      .map((e: any) => `${Number(e?.testcaseId)}|${String(e.tcVersionId)}|${e?.expAssignedTo ?? null}`));
+    const seenAnyVersion = new Set(existing
+      .filter((e: any) => !e?.tcVersionId)
+      .map((e: any) => `${Number(e?.testcaseId)}|${e?.expAssignedTo ?? null}`));
     const added: string[] = [];
     const skipped: Array<{ code: string; reason: string }> = [];
     const rows: Record<string, unknown>[] = [];
     for (const c of candidates) {
       const code = str(c.raw, 'code') ?? `TC-${c.raw.id}`;
-      const key = `${Number(c.raw.id)}|${assignee}`;
-      if (seen.has(key)) { skipped.push({ code, reason: 'already in the plan' }); continue; }
-      seen.add(key);
+      const key = `${Number(c.raw.id)}|${String(c.versionId ?? '')}|${assignee}`;
+      if (seenAnyVersion.has(`${Number(c.raw.id)}|${assignee}`)) {
+        skipped.push({ code, reason: 'already in the plan' });
+        continue;
+      }
+      if (seenExact.has(key)) { skipped.push({ code, reason: `already in the plan (${c.versionName || c.versionId})` }); continue; }
+      seenExact.add(key);
       const tcDesc = str(c.raw, 'description');
       rows.push({
         testcaseId: Number(c.raw.id), code, projectId, moduleId: Number(c.raw.moduleId),
@@ -7318,86 +7743,159 @@ export class SimplifyQaAdapter {
     return doc && typeof doc === 'object' && doc.id !== undefined ? doc : null;
   }
 
-  /** Configure the plan's STACK canvas with N stacks and distribute its automation test cases across
-   *  them — the same document the UI's Stack Setup saves (`POST/PUT /tm/executionFlow`, flowType
-   *  'STACK'). Round-robin by default; the backend divides the saved stacks at run time. */
-  async configurePlanStacks(planId: string, opts: { count: number; mode?: 'CLOUD' | 'LOCAL'; browser?: string }): Promise<{
-    created: boolean;
-    /** CLOUD stacks only: whether the project has a cloud machine to run them on. */
-    cloudAvailable?: boolean;
-    stacks: Array<{ id: string; name: string; mode: string; codes: string[] }>;
-  }> {
-    const count = Math.trunc(opts.count);
-    if (!Number.isFinite(count) || count < 1) throw new Error('stacks must be at least 1.');
+  /** Configure the plan's STACK canvas — N stacks (or one described per stack: local / remote / cloud, its browser, its machine,
+   *  its test cases) with the plan's automation test cases spread over them — the same document the UI's Stack Setup saves
+   *  (`POST/PUT /tm/executionFlow`, flowType 'STACK'). Round-robin unless test cases are named; `append` adds stacks to the
+   *  saved setup. The backend divides the saved stacks at run time. */
+  async configurePlanStacks(planId: string, opts: StackSetupInput): Promise<StackSetupResult> {
     const plan = await this.readOwnPlan(planId, { writable: true });
     const projectId = this.requireProjectId();
-    const mode = (opts.mode ?? 'CLOUD').toUpperCase() as 'CLOUD' | 'LOCAL';
-
+    const label = String(plan['code'] ?? planId);
     const entries = (await this.listPlanEntries(Number(plan['id'])))
       .filter((e) => String(e.executionType ?? '').toUpperCase() === 'AUTOMATION' && String(e.status ?? '').toUpperCase() !== 'BLOCKED');
-    if (!entries.length) throw new Error(`${plan['code'] ?? planId} has no AUTOMATION test cases to distribute.`);
-
-    const browserKey = (opts.browser ?? 'chrome').toLowerCase();
-    const browser = { name: browserKey.charAt(0).toUpperCase() + browserKey.slice(1), key: browserKey, type: 'NONE' };
-    const existing = await this.getPlanStacks(planId);
-    const stackDefs: any[] = Array.from({ length: count }, (_, i) => ({
-      id: randomUUID(), name: `Stack ${i + 1}`, position: null,
-      mode, agentId: null,
-      executionPlatform: { LOCAL: {}, REMOTE: {}, CLOUD: mode === 'CLOUD' ? { browser } : {} },
-      items: [] as any[],
-    }));
-    entries.forEach((e, i) => {
-      const stack = stackDefs[i % count];
+    if (!entries.length) throw new Error(`${label} has no AUTOMATION test cases to distribute.`);
+    const cases: StackCase[] = entries.map((e) => {
       const tech = String(e.tcType ?? 'WEB').toUpperCase();
       const p = e.executionPlatform ?? {};
-      const platform = PLAN_SPECIAL_TECH.includes(tech)
-        ? [{ name: tech, id: tech, technologyType: tech, type: 'NONE' }]
-        : tech === 'WEB'
-          ? [{ name: browser.name, id: browser.key, technologyType: 'WEB', type: 'NONE' }]
-          : [{ name: p.name, id: p.id, technologyType: p.technologyType ?? tech, type: p.type ?? 'NONE',
-              ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) }];
-      const item = {
-        id: e.testcaseId, versionId: e.tcVersionId, stepId: e.stepId, type: e.type ?? 'TC',
-        technologyType: tech, name: e.tcName ?? '', description: '', versionName: e.versionName ?? '',
-        seq: e.seq ?? 0, stepCount: -1, code: e.code ?? '', prerequisite: '',
-        projectId, projectName: '', moduleId: e.moduleId ?? null, moduleName: '',
-        userstoryId: e.userstoryId ?? null, userstoryName: '',
-        sourceType: e.sourceType ?? null, sourceId: e.sourceId ?? null,
-        assignTo: e.expAssignedTo ?? null, assignDate: e.expAssignedDate ?? null, assigneeName: '',
-        createdByName: '', createdBy: null,
-        executionType: 'AUTOMATION', status: 'NOTEXECUTED', executionId: null, executionOS: null,
-        iterationsSelected: [], platform,
+      return {
+        ref: { code: e.code ?? `TC-${e.testcaseId}`, id: String(e.testcaseId) },
+        key: `${e.testcaseId}|${e.stepId ?? ''}`, tech,
+        nativePlatform: { name: p.name, id: p.id, technologyType: p.technologyType ?? tech, type: p.type ?? 'NONE',
+          ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) },
+        item: (platform) => ({
+          id: e.testcaseId, versionId: e.tcVersionId, stepId: e.stepId, type: e.type ?? 'TC',
+          technologyType: tech, name: e.tcName ?? '', description: '', versionName: e.versionName ?? '',
+          seq: e.seq ?? 0, stepCount: -1, code: e.code ?? '', prerequisite: '',
+          projectId, projectName: '', moduleId: e.moduleId ?? null, moduleName: '',
+          userstoryId: e.userstoryId ?? null, userstoryName: '',
+          sourceType: e.sourceType ?? null, sourceId: e.sourceId ?? null,
+          assignTo: e.expAssignedTo ?? null, assignDate: e.expAssignedDate ?? null, assigneeName: '',
+          createdByName: '', createdBy: null,
+          executionType: 'AUTOMATION', status: 'NOTEXECUTED', executionId: null, executionOS: null,
+          iterationsSelected: [], platform,
+        }),
       };
-      stack.items.push(item);
+    });
+    return this.saveStackFlow('EP', Number(plan['id']), label, projectId, cases, opts, await this.getPlanStacks(planId));
+  }
+
+  /** Save a STACK canvas (plan or suite) the way the UI's Save does and read it back. Per stack: its platform (LOCAL stamps this
+   *  machine's agent, REMOTE the chosen machine, CLOUD none) and the browser its WEB test cases run in; test cases spread
+   *  round-robin, or as named. `append` keeps the saved stacks and adds new ones. Refuses what the UI refuses (an empty stack). */
+  private async saveStackFlow(
+    parentType: 'EP' | 'SU', parentId: number, label: string, projectId: number,
+    cases: StackCase[], opts: StackSetupInput, existing: Record<string, any> | null,
+  ): Promise<StackSetupResult> {
+    const append = opts.append === true;
+    const savedStacks: any[] = Array.isArray(existing?.['stacks']) ? existing['stacks'] : [];
+    if (append && !savedStacks.length) throw new Error(`${label} has no saved stack setup to add to — run stack_setup without append first.`);
+    const fresh = resolveStacks({ count: opts.count, mode: opts.mode, browser: opts.browser, stackConfigs: opts.stackConfigs });
+
+    // REMOTE stacks name a machine — resolve it to the registry row id the UI stores, refusing one that does not exist.
+    const needsRemote = fresh.some((s) => s.mode === 'REMOTE');
+    const machines = needsRemote ? await this.listLocalAgents() : [];
+    for (const s of fresh) {
+      if (s.mode !== 'REMOTE') continue;
+      const want = String(s.agentId).trim().toLowerCase();
+      const hit = machines.find((m) => m.id.toLowerCase() === want) ?? machines.find((m) => (m.name ?? '').toLowerCase() === want);
+      if (!hit) {
+        throw new Error(`No machine "${s.agentId}" to run a REMOTE stack on. Registered: ${machines.map((m) => `${m.name ?? m.id} (${m.id})`).join(', ') || '(none)'}.`);
+      }
+      s.agentId = hit.id;
+    }
+    // LOCAL stacks carry the saving user's own agent (the UI stamps `_us.agentId`); without a registered agent it stays empty.
+    let localAgent: string | null = null;
+    if (fresh.some((s) => s.mode === 'LOCAL')) localAgent = await this.resolveLocalAgentId().catch(() => null);
+
+    const keyOf = (it: any): string => `${it?.id ?? it?.testcaseId}|${it?.stepId ?? ''}`;
+    const current: number[][] = append
+      ? savedStacks.map((s) => (Array.isArray(s?.items) ? s.items : [])
+        .map((it: any) => cases.findIndex((c) => c.key === keyOf(it))).filter((i: number) => i >= 0))
+      : [];
+    const { buckets, unassigned } = distributeCases(cases.map((c) => c.ref), fresh, current);
+    const empty = firstEmptyStack(buckets);
+    if (empty !== undefined) {
+      throw new Error(`${label} has ${cases.length} test case(s) — it cannot fill ${buckets.length} stacks (stack ${empty} would have none, and every stack needs at least one). Use fewer stacks or name test cases for it.`);
+    }
+
+    type Cfg = { id: string; name: string; position: unknown; mode: StackMode; agentId: string | null; executionPlatform: Record<string, any>; createdBy?: unknown };
+    const cfgs: Cfg[] = savedStacks.map((s, i) => ({
+      id: String(s.id), name: String(s.name ?? `Stack ${i + 1}`), position: s.position ?? null,
+      mode: (String(s.mode ?? 'LOCAL').toUpperCase() as StackMode), agentId: s.agentId ?? null,
+      executionPlatform: { LOCAL: {}, REMOTE: {}, CLOUD: {}, ...(s.executionPlatform ?? {}) },
+      ...(s.createdBy !== undefined ? { createdBy: s.createdBy } : {}),
+    }));
+    if (!append) cfgs.length = 0;
+    const taken = new Set(cfgs.map((c) => c.name.toLowerCase()));
+    fresh.forEach((s) => {
+      let n = cfgs.length + 1;
+      while (taken.has(`stack ${n}`)) n++;
+      const name = `Stack ${n}`;
+      taken.add(name.toLowerCase());
+      cfgs.push({
+        id: randomUUID(), name, position: null, mode: s.mode,
+        agentId: s.mode === 'REMOTE' ? s.agentId : s.mode === 'LOCAL' ? localAgent : null,
+        executionPlatform: { LOCAL: {}, REMOTE: {}, CLOUD: {}, [s.mode]: { browser: { id: s.browser.key, key: s.browser.key, name: s.browser.key, technologyType: 'WEB', type: 'NONE' } } },
+      });
     });
 
+    const stackDefs = cfgs.map((c, n) => {
+      const mine = (buckets[n] ?? []).map((i) => cases[i]!);
+      const bucket = c.executionPlatform[c.mode] ?? {};
+      const savedKey = bucket.browser?.key ?? bucket.browser?.id;
+      const browser: UiBrowser = savedKey ? { key: String(savedKey), name: String(savedKey), technologyType: 'WEB', type: 'NONE' } : pickBrowser(undefined, c.mode);
+      // like the UI, a browser pick only stays where the stack has a WEB test case
+      const hasWeb = mine.some((k) => k.tech === 'WEB');
+      for (const m of ['LOCAL', 'REMOTE', 'CLOUD'] as const) if (!hasWeb && c.executionPlatform[m]?.browser) delete c.executionPlatform[m].browser;
+      if (hasWeb && !c.executionPlatform[c.mode].browser) c.executionPlatform[c.mode] = { ...c.executionPlatform[c.mode], browser: { id: browser.key, key: browser.key, name: browser.key, technologyType: 'WEB', type: 'NONE' } };
+      return {
+        ...c,
+        items: mine.map((k) => k.item(
+          PLAN_SPECIAL_TECH.includes(k.tech)
+            ? [{ name: k.tech, id: k.tech, technologyType: k.tech, type: 'NONE' }]
+            : k.tech === 'WEB' ? [{ name: browser.key, id: browser.key, technologyType: 'WEB', type: 'NONE' }] : [k.nativePlatform],
+        )),
+      };
+    });
+
+    const viewMode = existing?.['viewMode'] === 'canvas' ? 'canvas' : 'grid';   // the validator takes only 'grid' | 'canvas'
     const payload: Record<string, unknown> = {
       ...(existing?.['id'] ? { id: existing['id'] } : {}),
-      parentId: Number(plan['id']), parentType: 'EP', flowType: 'STACK', projectId,
-      viewMode: false, stacks: stackDefs.map((s) => ({ ...s, position: s.position ?? null })),
-      connections: [], canvasConfig: { startNodePosition: { x: 0, y: 0 } },
+      parentId, parentType, flowType: 'STACK', projectId, viewMode, stacks: stackDefs,
+      connections: append && Array.isArray(existing?.['connections']) ? existing['connections'] : [],
+      canvasConfig: existing?.['canvasConfig'] ?? { startNodePosition: { x: 300, y: 50 } },
     };
     if (existing?.['id']) await this.http.putJson<any>('/tm/executionFlow', payload);
     else await this.http.postJson<any>('/tm/executionFlow', payload);
 
     // Read it back — the canvas shows the saved document, and a run divides by it.
-    const after = await this.getPlanStacks(planId);
-    const savedStacks: any[] = Array.isArray(after?.['stacks']) ? after['stacks'] : [];
-    if (savedStacks.length !== count) {
-      throw new Error(`Saved ${count} stack(s) but the plan's STACK drawing reads back ${savedStacks.length}.`);
+    const after = parentType === 'EP' ? await this.getPlanStacks(String(parentId)) : await this.getSuiteStacks(String(parentId));
+    const saved: any[] = Array.isArray(after?.['stacks']) ? after['stacks'] : [];
+    if (saved.length !== stackDefs.length) throw new Error(`Saved ${stackDefs.length} stack(s) but ${label}'s STACK drawing reads back ${saved.length}.`);
+    const wrong = saved.findIndex((s, n) => (Array.isArray(s?.items) ? s.items.length : 0) !== (buckets[n]?.length ?? 0));
+    if (wrong >= 0) throw new Error(`${label}'s stack ${wrong + 1} reads back with a different number of test cases than was saved.`);
+
+    const usesCloud = saved.some((s) => String(s?.mode).toUpperCase() === 'CLOUD');
+    const cloudAvailable = usesCloud ? (await this.listCloudRunners().catch(() => [])).some((r) => r.online) : undefined;
+    const notes: string[] = [];
+    if (fresh.some((s) => s.mode === 'LOCAL') && !localAgent) {
+      notes.push('No local agent is registered on this machine, so the LOCAL stack(s) carry no agent yet — open the Stack Setup and save it from the machine that will run them.');
     }
-    const cloudAvailable = mode === 'CLOUD' ? (await this.listCloudRunners().catch(() => [])).some((r) => r.online) : undefined;
     return {
       created: !existing,
       ...(cloudAvailable !== undefined ? { cloudAvailable } : {}),
-      stacks: savedStacks.map((s: any, i: number) => ({
-        id: String(s.id ?? ''), name: String(s.name ?? `Stack ${i + 1}`), mode: String(s.mode ?? mode),
+      stacks: saved.map((s: any, n: number) => ({
+        id: String(s.id ?? ''), name: String(s.name ?? `Stack ${n + 1}`), mode: String(s.mode ?? ''),
+        ...(s.agentId ? { agentId: String(s.agentId) } : {}),
+        ...(s.executionPlatform?.[String(s.mode ?? '')]?.browser?.name ? { browser: String(s.executionPlatform[String(s.mode)].browser.name) } : {}),
         codes: (Array.isArray(s.items) ? s.items : []).map((it: any) => String(it.code ?? `TC-${it.id}`)),
       })),
+      ...(unassigned.length ? { unassigned: unassigned.map((i) => cases[i]!.ref.code) } : {}),
+      ...(notes.length ? { notes } : {}),
     };
   }
 
-  async startExecutionPlanRun(planId: string, opts: { agentId?: string; mode?: 'local' | 'remote' | 'cloud' | 'stack' }): Promise<PlanRunRef> {
+  async startExecutionPlanRun(planId: string, opts: { agentId?: string; mode?: 'local' | 'remote' | 'cloud' | 'stack'; browser?: string }): Promise<PlanRunRef> {
     const plan = await this.readOwnPlan(planId);
     const code = String(plan['code'] ?? `PL-${plan['id']}`);
     const projectId = this.requireProjectId();
@@ -7424,6 +7922,7 @@ export class SimplifyQaAdapter {
     // (NONE when cloud isn't set up) — it is NOT gated on a cloud machine unless a stack really is CLOUD.
     let agentId: string | undefined;
     let cloudType = 'NONE';
+    let stackCount = 0;
     const requireLocalAgent = async (): Promise<string> => {
       const probe = await this.probeLocalAgentDetailed();
       if (!probe.up) {
@@ -7451,6 +7950,7 @@ export class SimplifyQaAdapter {
       const flow = await this.getPlanStacks(planId);
       const stacks: any[] = Array.isArray(flow?.['stacks']) ? flow!['stacks'] : [];
       if (!stacks.length) throw new Error(`${code} has no saved stack setup — configure it first (action:"stack_setup").`);
+      stackCount = stacks.length;
       // The backend runs only the stacks holding a test case assigned to the user who starts the run, and silently does
       // nothing for anyone else — refuse that here instead of reporting a run that executes nothing.
       const me = await this.ensureUserId();
@@ -7458,6 +7958,10 @@ export class SimplifyQaAdapter {
       if (!mine.length) {
         throw new Error(`None of ${code}'s stack test cases are assigned to you, so a stack run started by you would execute nothing. ` +
           'Run it as the assignee, or assign the test cases to yourself.');
+      }
+      const noMachine = mine.filter((s) => String(s?.mode).toUpperCase() === 'REMOTE' && !s?.agentId);
+      if (noMachine.length) {
+        throw new Error(`${code} has REMOTE stack(s) with no machine chosen (${noMachine.map((s) => s?.name ?? s?.id).join(', ')}) — pick one with stack_setup (stackConfigs: [{ mode:"remote", agentId }]).`);
       }
       const cloudStacks = mine.filter((s) => String(s?.mode).toUpperCase() === 'CLOUD');
       if (cloudStacks.length) {
@@ -7486,6 +7990,7 @@ export class SimplifyQaAdapter {
 
     const items: any[] = [];
     const started: string[] = [];
+    const cloudNeedsBrowser: string[] = [];
     const skipped: Array<{ code: string; reason: string }> = [];
     for (const e of runnable) {
       const item = shellItems.find((it) => it.id == e.testcaseId && it.assignTo == e.expAssignedTo
@@ -7494,16 +7999,30 @@ export class SimplifyQaAdapter {
       if (!item) { skipped.push({ code: c, reason: "not part of the plan's last execution" }); continue; }
       const tech = String(item.technologyType ?? e.tcType ?? '');
       const p = e.executionPlatform ?? {};
-      const platform = PLAN_SPECIAL_TECH.includes(tech)
+      let cloudWeb: Array<Record<string, unknown>> | undefined;
+      if (runMode === 'cloud' && tech.toUpperCase() === 'WEB') {
+        // the cloud picker is Chrome / Firefox / Edge Headless: a browser the caller names applies to every web test case
+        if (opts.browser) cloudWeb = [cloudBrowserEntry(opts.browser)];
+        else if (/_HEADLESS$/i.test(String(p.id ?? ''))) cloudWeb = [{ name: p.name, id: p.id, technologyType: 'WEB', type: p.type ?? 'NONE' }];
+        else { cloudNeedsBrowser.push(c); continue; }
+      }
+      const platform = cloudWeb ?? (PLAN_SPECIAL_TECH.includes(tech)
         ? [{ name: tech, id: tech, technologyType: tech, type: 'NONE' }]
         : [{ name: p.name, id: p.id, technologyType: p.technologyType, type: p.type,
-          ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) }];
+          ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) }]);
       items.push({ ...item, name: e.tcName, isSelected: true, platform, configuration: {}, startTime: new Date().toISOString() });
       started.push(c);
+    }
+    if (cloudNeedsBrowser.length) {
+      throw new Error(
+        `ASK the user which browser to run ${code} in on the cloud — ${CLOUD_BROWSER_NAMES.join(', ')} (cloud runs are headless) — then call again with \`browser\` set. ` +
+        `It has no saved cloud browser for: ${cloudNeedsBrowser.join(', ')}.`,
+      );
     }
     if (!items.length) throw new Error(`${code} can't run: none of its test cases are part of the plan's last execution.`);
 
     const shellCode = String(shell.code ?? `#${shell.id}`);
+    const priorStatus = String(shell.status ?? 'NOTEXECUTED');
     await this.http.putJson<any>('/exec/execution/status', { id: Number(shell.id), projectId, status: 'INPROGRESS' });
     const body: Record<string, unknown> = { ...shell };
     for (const k of PLAN_RUN_DROP_KEYS) delete body[k];
@@ -7517,6 +8036,9 @@ export class SimplifyQaAdapter {
       globalConfiguration: {
         TERMINATE_ON_FAIL: plan['terminateOnFailure'] ?? false, NEW_BROWSER_SESSION: plan['newBrowserSession'] ?? false,
         RE_EXECUTION_COUNT: plan['autoReExecCount'] ?? 0, RE_EXECUTION_TYPE: plan['autoReExecTriggerOn'] ?? 'AFTER_TESTCASE',
+        // The Execute dialog's "containers" setting: one per stack for a stack run, else the plan's own limit.
+        MINIMUM_CONTAINER_COUNT: plan['minimumContainerCount'] ?? 0,
+        MAXIMUM_CONTAINER_COUNT: plan['maximumContainerCount'] ?? (runMode === 'stack' ? Math.max(1, stackCount) : 5),
       },
       executionItems: runMode === 'stack' ? [] : items,
     });
@@ -7524,11 +8046,24 @@ export class SimplifyQaAdapter {
     try {
       created = await this.http.postJson<any>('/exec/execution', body);
     } catch (e) {
-      throw new Error(`Starting ${code} failed after its execution ${shellCode} was marked INPROGRESS in SimplifyQA: ` +
-        `${e instanceof Error ? e.message : String(e)}. It may show as in progress until it is reset there.`);
+      // The shell was flipped to INPROGRESS above; a refused start must put it back or the plan looks
+      // permanently in progress and every later run reports "no execution id".
+      try {
+        await this.http.putJson<any>('/exec/execution/status', { id: Number(shell.id), projectId, status: priorStatus });
+      } catch { /* best effort — the original error is the one to report */ }
+      throw new Error(`Starting ${code} did not run: ${e instanceof Error ? e.message : String(e)} ` +
+        `(${shellCode} was restored to ${priorStatus}).`);
     }
     const runId = str(created?.data ?? created, 'id');
-    if (!runId) throw new Error(`Starting ${code}: SimplifyQA returned no execution id (${shellCode} is marked INPROGRESS).`);
+    if (!runId) {
+      // Same rollback as a refused POST: never leave the plan's shell stuck INPROGRESS.
+      try {
+        await this.http.putJson<any>('/exec/execution/status', { id: Number(shell.id), projectId, status: priorStatus });
+      } catch { /* best effort */ }
+      const msg = str(created, 'message') ?? str(created?.error, 'message');
+      throw new Error(`Starting ${code} did not run: SimplifyQA returned no execution id` +
+        `${msg ? ` — ${msg}` : ''} (${shellCode} was restored to ${priorStatus}).`);
+    }
     return { runId, started, skipped: [...skipped] };
   }
 
@@ -7585,86 +8120,48 @@ export class SimplifyQaAdapter {
     return doc && typeof doc === 'object' && doc.id !== undefined ? doc : null;
   }
 
-  /** Configure the suite's STACK canvas with N stacks and spread its test cases across them — the same
-   *  document the suite's Stack canvas saves (`POST/PUT /tm/executionFlow`, parentType 'SU', flowType
-   *  'STACK'). Round-robin; the backend divides the saved stacks at run time. */
-  async configureSuiteStacks(suiteId: string, opts: { count: number; mode?: 'CLOUD' | 'LOCAL'; browser?: string }): Promise<{
-    created: boolean;
-    cloudAvailable?: boolean;
-    stacks: Array<{ id: string; name: string; mode: string; codes: string[] }>;
-  }> {
-    const count = Math.trunc(opts.count);
-    if (!Number.isFinite(count) || count < 1) throw new Error('stacks must be at least 1.');
+  /** Configure the suite's STACK canvas — N stacks (or one described per stack) with its test cases spread over them — the same
+   *  document the suite's Stack canvas saves (`POST/PUT /tm/executionFlow`, parentType 'SU', flowType 'STACK'). Same options as
+   *  a plan's: per-stack platform / browser / machine, named test cases, `append`. */
+  async configureSuiteStacks(suiteId: string, opts: StackSetupInput): Promise<StackSetupResult> {
     const suite = await this.readOwnSuite(suiteId);
     const label = String(suite['code'] ?? `SU-${suite['id']}`);
     if (String(suite['suiteType'] ?? 'AUTOMATION').toUpperCase() === 'MANUAL') {
       throw new Error(`${label} is a manual suite — Stack execution is for automation suites.`);
     }
     const projectId = this.requireProjectId();
-    const mode = (opts.mode ?? 'CLOUD').toUpperCase() as 'CLOUD' | 'LOCAL';
-
     const rows = (Array.isArray(suite['testCases']) ? suite['testCases'] : []).filter((r: any) => r?.deleted !== true && r?.stepId);
     if (!rows.length) throw new Error(`${label} has no saved test cases to distribute.`);
-    const browserKey = (opts.browser ?? 'chrome').toLowerCase();
-    const browser = { name: browserKey.charAt(0).toUpperCase() + browserKey.slice(1), key: browserKey, type: 'NONE' };
-    const existing = await this.getSuiteStacks(suiteId);
-    const stackDefs: any[] = Array.from({ length: count }, (_, i) => ({
-      id: randomUUID(), name: `Stack ${i + 1}`, position: null,
-      mode, agentId: null,
-      executionPlatform: { LOCAL: {}, REMOTE: {}, CLOUD: mode === 'CLOUD' ? { browser } : {} },
-      items: [] as any[],
-    }));
-    let i = 0;
+    const cases: StackCase[] = [];
+    let seq = 0;
     for (const row of rows) {
       const rawTc = await this.fetchRawTestcase(String(row.testcaseId)).catch(() => undefined);
       if (!rawTc || !Object.keys(rawTc).length) continue;
       const tech = String(str(rawTc, 'tcType') ?? 'WEB').toUpperCase();
       const versions: any[] = Array.isArray(rawTc?.versions) ? rawTc.versions : [];
       const ver = versions.find((v: any) => str(v, 'id', '_id') === String(row.versionId));
-      const p = row?.executionPlatform?.[mode] ?? {};
-      const platform = PLAN_SPECIAL_TECH.includes(tech)
-        ? [{ name: tech, id: tech, technologyType: tech, type: 'NONE' }]
-        : tech === 'WEB'
-          ? [{ name: browser.name, id: browser.key, technologyType: 'WEB', type: 'NONE' }]
-          : [{ name: p.name, id: p.id, technologyType: p.technologyType ?? tech, type: p.type ?? 'NONE',
-              ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) }];
-      stackDefs[i % count].items.push({
-        id: Number(rawTc.id ?? row.testcaseId), versionId: row.versionId, stepId: row.stepId, type: 'TC',
-        technologyType: tech, name: str(rawTc, 'name', 'title') ?? '', description: '', versionName: str(ver, 'name') ?? '',
-        seq: row.seq ?? i + 1, stepCount: -1, code: str(rawTc, 'code') ?? '', prerequisite: '',
-        projectId, projectName: '', moduleId: rawTc.moduleId ?? null, moduleName: '',
-        userstoryId: rawTc.userstoryId ?? null, userstoryName: '',
-        sourceType: null, sourceId: null, assignTo: null, assignDate: null, assigneeName: '',
-        createdByName: '', createdBy: null,
-        executionType: 'AUTOMATION', status: 'NOTEXECUTED', executionId: null, executionOS: null,
-        iterationsSelected: [], platform,
+      const p = row?.executionPlatform?.LOCAL ?? row?.executionPlatform?.CLOUD ?? row?.executionPlatform ?? {};
+      const n = ++seq;
+      cases.push({
+        ref: { code: str(rawTc, 'code') ?? `TC-${rawTc.id ?? row.testcaseId}`, id: String(rawTc.id ?? row.testcaseId) },
+        key: `${rawTc.id ?? row.testcaseId}|${row.stepId ?? ''}`, tech,
+        nativePlatform: { name: p.name, id: p.id, technologyType: p.technologyType ?? tech, type: p.type ?? 'NONE',
+          ...(p.cloudDeviceType ? { cloudDeviceType: p.cloudDeviceType } : {}), ...(p.osVersion ? { osVersion: p.osVersion } : {}) },
+        item: (platform) => ({
+          id: Number(rawTc.id ?? row.testcaseId), versionId: row.versionId, stepId: row.stepId, type: 'TC',
+          technologyType: tech, name: str(rawTc, 'name', 'title') ?? '', description: '', versionName: str(ver, 'name') ?? '',
+          seq: row.seq ?? n, stepCount: -1, code: str(rawTc, 'code') ?? '', prerequisite: '',
+          projectId, projectName: '', moduleId: rawTc.moduleId ?? null, moduleName: '',
+          userstoryId: rawTc.userstoryId ?? null, userstoryName: '',
+          sourceType: null, sourceId: null, assignTo: null, assignDate: null, assigneeName: '',
+          createdByName: '', createdBy: null,
+          executionType: 'AUTOMATION', status: 'NOTEXECUTED', executionId: null, executionOS: null,
+          iterationsSelected: [], platform,
+        }),
       });
-      i++;
     }
-    if (!i) throw new Error(`None of ${label}'s test cases could be read, so there is nothing to distribute.`);
-    if (count > i) throw new Error(`${label} has ${i} test case(s) — it cannot fill ${count} stacks (every stack needs at least one).`);
-
-    const payload: Record<string, unknown> = {
-      ...(existing?.['id'] ? { id: existing['id'] } : {}),
-      parentId: Number(suite['id']), parentType: 'SU', flowType: 'STACK', projectId,
-      viewMode: false, stacks: stackDefs,
-      connections: [], canvasConfig: { startNodePosition: { x: 0, y: 0 } },
-    };
-    if (existing?.['id']) await this.http.putJson<any>('/tm/executionFlow', payload);
-    else await this.http.postJson<any>('/tm/executionFlow', payload);
-
-    const after = await this.getSuiteStacks(suiteId);
-    const saved: any[] = Array.isArray(after?.['stacks']) ? after['stacks'] : [];
-    if (saved.length !== count) throw new Error(`Saved ${count} stack(s) but ${label}'s STACK drawing reads back ${saved.length}.`);
-    const cloudAvailable = mode === 'CLOUD' ? (await this.listCloudRunners().catch(() => [])).some((r) => r.online) : undefined;
-    return {
-      created: !existing,
-      ...(cloudAvailable !== undefined ? { cloudAvailable } : {}),
-      stacks: saved.map((s: any, n: number) => ({
-        id: String(s.id ?? ''), name: String(s.name ?? `Stack ${n + 1}`), mode: String(s.mode ?? mode),
-        codes: (Array.isArray(s.items) ? s.items : []).map((it: any) => String(it.code ?? `TC-${it.id}`)),
-      })),
-    };
+    if (!cases.length) throw new Error(`None of ${label}'s test cases could be read, so there is nothing to distribute.`);
+    return this.saveStackFlow('SU', Number(suite['id']), label, projectId, cases, opts, await this.getSuiteStacks(suiteId));
   }
 
   /** What a suite STACK run needs, checked before anything is created: a saved canvas with no empty stack,
@@ -7690,6 +8187,10 @@ export class SimplifyQaAdapter {
         );
       }
       cloudType = online[0]?.cloudType ?? 'VM';
+    }
+    const noMachine = stacks.filter((s) => String(s?.mode).toUpperCase() === 'REMOTE' && !s?.agentId);
+    if (noMachine.length) {
+      throw new Error(`${label} has REMOTE stack(s) with no machine chosen (${noMachine.map((s) => s?.name ?? s?.id).join(', ')}) — pick one with stack_setup (stackConfigs: [{ mode:"remote", agentId }]).`);
     }
     let agentId: string | null = null;
     if (stacks.some((s) => (String(s?.mode ?? 'LOCAL')).toUpperCase() === 'LOCAL')) {
@@ -7786,14 +8287,14 @@ export class SimplifyQaAdapter {
     if (target.suiteId) {
       schedulerType = 'SU';
       parent = await this.readOwnSuite(target.suiteId);
-      platForm = suitePlatform(parent, opts.browser, 'schedule it');
+      platForm = suitePlatform(parent, opts.browser, 'schedule it', opts.mode === 'cloud');
     } else if (target.tcId) {
       schedulerType = 'TC';
       parent = await this.fetchRawTestcase(target.tcId);
       if (!Object.keys(parent).length || parent['deleted'] === true) throw new Error(`Test case ${target.tcId} not found.`);
       if (Number(parent['projectId']) !== projectId) throw new Error(`${parent['code'] ?? `TC-${parent['id']}`} is not in project ${projectId}.`);
       parentVersionId = testcaseVersion(parent, true).versionId || undefined;
-      platForm = tcPlatform(parent, opts.browser);
+      platForm = tcPlatform(parent, opts.browser, opts.mode === 'cloud');
     } else {
       throw new Error('Nothing to schedule: give a test case or a suite.');
     }
@@ -7924,6 +8425,8 @@ export class SimplifyQaAdapter {
     // WHAT it runs: a test case or a suite — the same schedule, re-pointed (the Scheduler form's type + target), with the platform and
     // version that kind of schedule carries, as createSchedule builds them.
     const notes: string[] = [];
+    // a cloud schedule's browsers are the cloud ones (headless); the mode being changed in the same call counts
+    const scheduleIsCloud = String(changes.mode ?? doc['executionMode'] ?? '').toLowerCase() === 'cloud';
     let target: { type: 'TC' | 'SU'; id: number; code: string } | undefined;
     if (changes.tcId !== undefined || changes.suiteId !== undefined) {
       if (changes.tcId !== undefined && changes.suiteId !== undefined) throw new Error('Give either a test case (tcId) or a suite (suiteId) to run, not both.');
@@ -7931,7 +8434,7 @@ export class SimplifyQaAdapter {
       const wasType = String(doc['schedulerType'] ?? '');
       if (changes.suiteId !== undefined) {
         const suite = await this.readOwnSuite(changes.suiteId);
-        const platForm = suitePlatform(suite, changes.browser, 'schedule it');
+        const platForm = suitePlatform(suite, changes.browser, 'schedule it', scheduleIsCloud);
         Object.assign(patch, { schedulerType: 'SU', parentId: Number(suite['id']), platForm, parentVersionId: undefined });
         target = { type: 'SU', id: Number(suite['id']), code: String(suite['code'] ?? `SU-${suite['id']}`) };
       } else {
@@ -7942,7 +8445,7 @@ export class SimplifyQaAdapter {
         const webEntry = (Array.isArray(doc['platForm']) ? doc['platForm'] : []).find((p: any) => String(p?.technologyType ?? '').toUpperCase() === 'WEB');
         const keepBrowser = changes.browser ?? (webEntry?.id ? String(webEntry.id) : undefined);
         Object.assign(patch, {
-          schedulerType: 'TC', parentId: Number(tc['id']), platForm: tcPlatform(tc, keepBrowser),
+          schedulerType: 'TC', parentId: Number(tc['id']), platForm: tcPlatform(tc, keepBrowser, scheduleIsCloud),
           parentVersionId: testcaseVersion(tc, true).versionId || undefined,
         });
         target = { type: 'TC', id: Number(tc['id']), code: String(tc['code'] ?? `TC-${tc['id']}`) };
@@ -7966,8 +8469,9 @@ export class SimplifyQaAdapter {
       throw new Error('A suite schedule needs a release (the Scheduler marks Release as required for a suite) — pass releaseId (id, code or name).');
     }
     if (changes.browser && doc['schedulerType'] === 'TC' && finalType === 'TC' && !('platForm' in patch)) {
-      const b = sqaBrowser(changes.browser);
-      patch['platForm'] = [{ id: b, name: b, type: 'NONE', technologyType: 'WEB' }];
+      patch['platForm'] = scheduleIsCloud
+        ? [cloudBrowserEntry(changes.browser)]
+        : (() => { const b = sqaBrowser(changes.browser); return [{ id: b, name: b, type: 'NONE', technologyType: 'WEB' }]; })();
     }
     if (changes.environmentId) patch['environment'] = await this.environmentKey(changes.environmentId);
     if (changes.agentId) patch['agentId'] = [changes.agentId];
@@ -8294,15 +8798,36 @@ export class SimplifyQaAdapter {
 
   /** Assemble the strict allow-listed suite entry for an ADD op. Required fields per the SQA
    *  validator: testcaseId, code, seq (set by the caller), version, versionId, tcType. */
-  private async buildSuiteEntryFromTestcase(tcNum: string): Promise<Record<string, unknown>> {
+  private async buildSuiteEntryFromTestcase(tcNum: string, requested?: { versionId?: string; version?: string }): Promise<Record<string, unknown>> {
     const raw = await this.fetchRawTestcase(tcNum);
     if (Object.keys(raw).length === 0) throw new Error(`test case ${tcNum} not found (cannot add to suite)`);
     const code = str(raw, 'code', 'tcCode') ?? `TC_${tcNum}`;
     const tcType = str(raw, 'tcType') ?? 'WEB';
+    const versions: any[] = Array.isArray(raw?.versions) ? raw.versions : [];
     let versionName = str(raw, 'versionName', 'selectedVersionName');
     let versionId = str(raw, 'versionId', 'selectedVersionId');
-    if ((!versionName || !versionId) && Array.isArray(raw?.versions) && raw.versions.length > 0) {
-      const v = raw.versions[0];
+    // A caller may pin a version (the same TC can sit in a suite once per version). The backend only
+    // stores what we send, so an unknown version must FAIL here — otherwise v1.0 was silently added
+    // again and the caller saw "success" for a row that is not the requested one.
+    const wantId = (requested?.versionId ?? '').trim();
+    const wantName = (requested?.version ?? '').trim();
+    if (wantId || wantName) {
+      const hit = versions.find((v) => {
+        const id = str(v, 'id', '_id', 'versionId') ?? '';
+        const name = str(v, 'name', 'versionName') ?? '';
+        return (wantId && id === wantId) || (wantName && name.trim().toLowerCase() === wantName.toLowerCase());
+      });
+      if (!hit) {
+        const available = versions.map((v) => `${str(v, 'name') ?? '?'} (${str(v, 'id', '_id', 'versionId') ?? '?'})`).join(', ');
+        throw new Error(
+          `${code} has no version ${wantId ? `"${wantId}"` : `"${wantName}"`}. ` +
+            `Available versions: ${available || '(none)'}. Read them with sqa_query({ op:"get", collection:"testcases", id:"${code}" }).`,
+        );
+      }
+      versionName = str(hit, 'name', 'versionName') ?? versionName;
+      versionId = str(hit, 'id', '_id', 'versionId') ?? versionId;
+    } else if ((!versionName || !versionId) && versions.length > 0) {
+      const v = versions.find((x) => x?.isChecked === true || x?.selected === true) ?? versions[0];
       versionName ??= str(v, 'name');
       versionId ??= str(v, 'id', '_id');
     }
@@ -10410,6 +10935,7 @@ export class SimplifyQaAdapter {
     const stackRun = mode === 'STACK' ? await this.suiteStackRunPlan(rawSuite, opts) : undefined;
     const members: any[] = !stackRun && Array.isArray(rawSuite.testCases) ? rawSuite.testCases : [];
     const executionItems: Array<Record<string, unknown>> = [];
+    const cloudNeedsBrowser: string[] = [];
     let seqCounter = 0;
     for (const row of members) {
       seqCounter++;
@@ -10435,7 +10961,13 @@ export class SimplifyQaAdapter {
       // mode, send `[]` and let the backend reject/accept per its own rules.
       const savedPlatform = row?.executionPlatform?.[mode];
       let platform: Array<Record<string, unknown>> = [];
-      if (savedPlatform && typeof savedPlatform === 'object') {
+      if (mode === 'CLOUD' && tcType === 'WEB') {
+        // the cloud picker is Chrome / Firefox / Edge Headless: a browser the caller names applies to every web test case (as the Run dialog's does)
+        const saved = savedPlatform && typeof savedPlatform === 'object' ? String(savedPlatform.id ?? savedPlatform.name ?? '') : '';
+        if (opts.browser) platform = [cloudBrowserEntry(opts.browser)];
+        else if (/_HEADLESS$/i.test(saved)) platform = [{ name: savedPlatform.name, id: savedPlatform.id ?? savedPlatform.name, technologyType: 'WEB', type: savedPlatform.type ?? 'NONE' }];
+        else cloudNeedsBrowser.push(str(rawTc, 'code') ?? `TC-${memberTcId}`);
+      } else if (savedPlatform && typeof savedPlatform === 'object') {
         const p: Record<string, unknown> = {
           name: savedPlatform.name,
           id: savedPlatform.id ?? savedPlatform.name,
@@ -10489,6 +11021,12 @@ export class SimplifyQaAdapter {
       });
     }
 
+    if (cloudNeedsBrowser.length) {
+      throw new Error(
+        `ASK the user which browser to run ${rawSuite.code ?? suiteId} in on the cloud — ${CLOUD_BROWSER_NAMES.join(', ')} (cloud runs are headless) — then call again with \`browser\` set. ` +
+        `It has no saved cloud browser for: ${cloudNeedsBrowser.join(', ')}.`,
+      );
+    }
     if (!stackRun && executionItems.length === 0) {
       throw new Error(
         `startRun: suite ${suiteId} has no runnable test cases (all members were deleted, ` +
@@ -10987,10 +11525,7 @@ export class SimplifyQaAdapter {
   ): Array<Record<string, unknown>> {
     const t = tcType.toUpperCase();
     if (t === 'WEB') {
-      if (mode === 'CLOUD') {
-        const key = `${(opts.browser ?? 'CHROME').toUpperCase()}_HEADLESS`;
-        return [{ name: key, id: key, technologyType: 'WEB', type: 'NONE' }];
-      }
+      if (mode === 'CLOUD') return [cloudBrowserEntry(opts.browser)];
       const b = (opts.browser ?? 'CHROME').toUpperCase();
       return [{ name: b, id: b, technologyType: 'WEB', type: 'NONE' }];
     }
@@ -11164,7 +11699,24 @@ export class SimplifyQaAdapter {
     return /Could not reach the product MCP|fetch failed|ECONNREFUSED/i.test(m);
   }
 
-  async readJournal(tcId: string): Promise<JournalView> {
+  /** A version of the test case by id or name ("v2.0"). Only versions of THIS test case are accepted —
+   *  an unknown one is refused with the list, never silently replaced by the current version. */
+  private async resolveTcVersion(tcId: string, ref: string): Promise<{ id: string; name: string }> {
+    const raw = await this.fetchRawTestcase(tcId);
+    const versions = toVersionEntries(Array.isArray(raw?.versions) ? raw.versions : []);
+    const want = ref.trim().toLowerCase();
+    const hit = versions.find((v) => v.id === ref.trim()) ?? versions.find((v) => (v.name ?? '').trim().toLowerCase() === want);
+    if (!hit) {
+      throw new Error(
+        `${tcId} has no version "${ref}". Its versions: ${versions.map((v) => `${v.name ?? '?'} (${v.id})`).join(', ') || '(none)'}.`,
+      );
+    }
+    return { id: hit.id, name: hit.name ?? hit.id };
+  }
+
+  async readJournal(tcId: string, versionId?: string): Promise<JournalView> {
+    // A non-current version has no journal on the agent (it only knows the recorded/current one): read its saved steps.
+    if (versionId) return this.stepsView(tcId, versionId);
     const h = this.hop();
     if (h) {
       try { return await h.readJournal(tcId); } catch (e) { if (!this.agentUnreachable(e)) throw e; }
@@ -11172,7 +11724,19 @@ export class SimplifyQaAdapter {
     return this.stepsView(tcId);
   }
 
-  async editJournal(tcId: string, ops: JournalOp[]): Promise<JournalView> {
+  async editJournal(tcId: string, ops: JournalOp[], versionId?: string): Promise<JournalView> {
+    if (versionId) {
+      // The agent's journal belongs to the current version only, so a pinned version is edited on its saved steps.
+      const pinned = new Set(['set_meta', 'add_step', 'update_step', 'update_steps', 'add_assertions', 'remove_step', 'remove_steps', 'move_step', 'insert_nested', 'duplicate_step']);
+      const needsAgent = ops.filter((o) => !pinned.has(o.op)).map((o) => o.op);
+      if (needsAgent.length) {
+        throw new Error(
+          `${needsAgent.join(', ')} cannot be applied to a chosen version (versionId "${versionId}") — it needs the agent, which only edits the current version. ` +
+          'Select that version as current in SimplifyQA first, or use the other ops.',
+        );
+      }
+      return this.editStepsDirect(tcId, ops, versionId);
+    }
     // Every step-editing op is applied straight to the saved test case. Sent through the agent, an edit
     // either opened the recorder window (SCRPY) and never landed, or — as with a plain `update_step` on
     // a saved TC — hit the agent's JOURNAL editor, which only knows recording journals and rejected a
@@ -11198,15 +11762,22 @@ export class SimplifyQaAdapter {
     return this.editStepsDirect(tcId, ops);
   }
 
-  private async stepsView(tcId: string): Promise<JournalView> {
-    const tc = await this.getTestCase(tcId);
-    return { tcId, source: 'steps', steps: tc.steps ?? [] };
+  private async stepsView(tcId: string, versionRef?: string): Promise<JournalView> {
+    const pinned = versionRef ? await this.resolveTcVersion(tcId, versionRef) : undefined;
+    const tc = await this.getTestCase(tcId, pinned?.id);
+    const cur = tc.versions?.find((v) => v.id === tc.currentVersionId);
+    return {
+      tcId, source: 'steps', steps: tc.steps ?? [],
+      ...(cur ? { version: { id: cur.id, name: cur.name ?? cur.id } } : {}),
+      ...(tc.versions ? { versionCount: tc.versions.length } : {}),
+    };
   }
 
   /** Agent-free step edit: read the test case, apply remove / update / move by step number, renumber, and
    *  save through updateTestCase (which sends removed steps back with `deleted:true`, as the UI does). */
-  private async editStepsDirect(tcId: string, ops: JournalOp[]): Promise<JournalView> {
-    let tc = await this.getTestCase(tcId);
+  private async editStepsDirect(tcId: string, ops: JournalOp[], versionRef?: string): Promise<JournalView> {
+    const pinned = versionRef ? await this.resolveTcVersion(tcId, versionRef) : undefined;
+    let tc = await this.getTestCase(tcId, pinned?.id);
     log(`[mcp][editStepsDirect] tcId=${tcId} technologyType=${tc.technologyType ?? '(none)'} executionPlatform=${tc.executionPlatform ? JSON.stringify(tc.executionPlatform) : '(none)'} steps=${tc.steps?.length ?? 0} ops=${ops.map(o => o.op).join(',')}`);
     let steps = [...(tc.steps ?? [])];
     for (const op of ops) {
@@ -11323,7 +11894,7 @@ export class SimplifyQaAdapter {
       steps = steps.map((x, k) => ({ ...x, n: k + 1 }));
     }
     await this.updateTestCase(tcId, { ...tc, steps });
-    return this.stepsView(tcId);
+    return this.stepsView(tcId, pinned?.id);
   }
 
   // ---------------------------------------------------------------------- Self-healing

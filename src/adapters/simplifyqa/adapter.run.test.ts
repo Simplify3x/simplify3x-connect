@@ -145,7 +145,8 @@ test('startRun posts the TESTCASE execution envelope and returns the report link
     stepCount: 0,
     technologyType: 'WEB',
     type: 'TC',
-    platform: [{ name: 'CHROMIUM_HEADLESS', id: 'CHROMIUM_HEADLESS', technologyType: 'WEB', type: 'NONE' }],
+    // a cloud run is headless: 'chromium' means Chrome Headless (CHROMIUM_HEADLESS is not a browser the cloud offers)
+    platform: [{ name: 'CHROME_HEADLESS', id: 'CHROME_HEADLESS', technologyType: 'WEB', type: 'NONE' }],
     projectId: 7,
     projectName: 'Proj Seven',
     configuration: {},

@@ -10,8 +10,9 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ok, err } from '../mcpResult.js';
 import type { ProviderAdapter } from '../adapters/types.js';
-import { autoDefectLogRefusal } from './autoDefectLog.js';
-import type { ExecutionPlanInput, PlanEntryInput, PlanEntryRef, PlanRunRef, SuiteRef } from '../adapters/simplifyqa/adapter.js';
+import { autoDefectLogRefusal, autoDefectLogRunNote } from './autoDefectLog.js';
+import { STACK_SETUP_DESC, stackConfigsSchema, stackSetupReply } from './stackSetupTool.js';
+import type { ExecutionPlanInput, PlanEntryInput, PlanEntryRef, PlanRunRef, StackSetupInput, StackSetupResult, SuiteRef } from '../adapters/simplifyqa/adapter.js';
 
 export type ExecutionPlanToolDeps = { getAdapter: () => ProviderAdapter | null };
 
@@ -23,10 +24,8 @@ type PlanWrites = {
   addPlanEntries: (id: string, input: PlanEntryInput) => Promise<{ added: string[]; skipped: Array<{ code: string; reason: string }> }>;
   planEntriesRemovePreview: (id: string, tcIds: string[]) => Promise<{ plan: SuiteRef; entries: PlanEntryRef[] }>;
   removePlanEntries: (id: string, tcIds: string[]) => Promise<{ removed: number; notRemoved: string[] }>;
-  startExecutionPlanRun: (id: string, opts: { agentId?: string; mode?: 'local' | 'remote' | 'cloud' | 'stack' }) => Promise<PlanRunRef>;
-  configurePlanStacks: (id: string, opts: { count: number; mode?: 'CLOUD' | 'LOCAL'; browser?: string }) => Promise<{
-    created: boolean; cloudAvailable?: boolean; stacks: Array<{ id: string; name: string; mode: string; codes: string[] }>;
-  }>;
+  startExecutionPlanRun: (id: string, opts: { agentId?: string; mode?: 'local' | 'remote' | 'cloud' | 'stack'; browser?: string }) => Promise<PlanRunRef>;
+  configurePlanStacks: (id: string, opts: StackSetupInput) => Promise<StackSetupResult>;
 };
 
 const NOT_CONNECTED =
@@ -66,12 +65,15 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
         '- action:"delete" — needs `planId`. TWO-STEP: call without `confirm` to PREVIEW (nothing is deleted; it ' +
         'states what is permanently lost), show it to the user, and call again with `confirm:true` ONLY after the user ' +
         'explicitly says to delete.\n' +
-        '- action:"add_testcases" — needs `planId` and `tcIds` and/or `suiteIds` (a suite adds its test cases). Optional ' +
-        '`assignTo` (user id or "me") and `assignDate` (YYYY-MM-DD); only assigned test cases can run. Duplicates are skipped.\n' +
+        '- action:"add_testcases" - needs `planId` and `tcIds`, `testCases` and/or `suiteIds` (a suite adds its test cases). Optional ' +
+        '`assignTo` (user id or "me") and `assignDate` (YYYY-MM-DD); only assigned test cases can run. To pin a VERSION pass ' +
+        '`testCases:[{ tcId:"TC-12826", version:"v2.0" }]` (or `versionId`, or one `versionId`/`version` for every `tcIds` entry) — ' +
+        'the same test case can sit in the plan once per version, so v1.0 and v2.0 are two entries. A version that does not exist ' +
+        'is an ERROR; a duplicate (same test case AND version) is skipped.\n' +
         '- action:"remove_testcases" — needs `planId` and `tcIds`. TWO-STEP like delete: removing also DELETES those ' +
         'test cases\' run history in SimplifyQA, which cannot be undone.\n' +
-        '- action:"stack_setup" — needs `planId` and `stacks` (how many, e.g. 2). Saves the plan\'s Stack Setup (what the UI\'s Stack tab saves) and ' +
-        'AUTO-DISTRIBUTES its automation test cases across the stacks, round-robin. Optional `stackMode` ("cloud" default | "local") and `browser`.\n' +
+        '- action:"stack_setup" — needs `planId` and `stacks` (how many, e.g. 2) or `stackConfigs`. ' + STACK_SETUP_DESC + ' Optional `stackMode` ("cloud" default | "local") and `browser` are the defaults for stacks that do not say. ' +
+        'A planner of the plan can do this, not only an admin.\n' +
         '- action:"run" — needs `planId`; call ONLY when the user explicitly asked to run this plan. It runs NOW — SimplifyQA cannot schedule an ' +
         'execution plan (its Scheduler takes a test case or a suite). `mode`: "local" (default — this machine\'s agent, which must be running), ' +
         '"remote" (another machine\'s agent: pass `agentId`), "cloud" (the project\'s cloud machine) or "stack" (the saved Stack Setup, ' +
@@ -81,13 +83,22 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
       inputSchema: {
         action: z.enum(['create', 'update', 'delete', 'add_testcases', 'remove_testcases', 'run', 'stack_setup']).describe('What to do.'),
         mode: z.enum(['local', 'remote', 'cloud', 'stack']).optional().describe('run: "local" (this machine\'s agent), "cloud" (a configured cloud machine), or "stack" (the saved stack setup, divided across its stacks).'),
-        stacks: z.number().int().min(1).optional().describe('stack_setup: how many stacks to create (e.g. 2).'),
+        stacks: z.number().int().min(1).optional().describe('stack_setup: how many stacks (e.g. 2) — with append:true, how many to ADD. Omit when stackConfigs lists them.'),
+        stackConfigs: stackConfigsSchema,
+        append: z.boolean().optional().describe('stack_setup: add the stack(s) to the saved setup instead of replacing it.'),
         stackMode: z.enum(['cloud', 'local']).optional().describe('stack_setup: what each stack runs on (default cloud).'),
-        browser: z.string().optional().describe('stack_setup: browser for WEB test cases (default chrome).'),
+        browser: z.string().optional().describe('stack_setup: browser for WEB test cases (default chrome). run, mode "cloud": the browser for the plan\'s web test cases — ONLY Chrome Headless, Firefox Headless or Edge Headless (pass chrome / firefox / edge). The run asks for it when a web test case has no saved cloud browser; never offer safari / webkit / chromium for the cloud.'),
         agentId: z.string().optional().describe('run: this machine\'s agent id (optional; auto-picked, see local_agents).'),
         when: z.enum(['immediate', 'schedule']).optional().describe('run: only "immediate" — execution plans cannot be scheduled in SimplifyQA.'),
         planId: z.string().optional().describe('Every action except create: plan id or code (PL-5).'),
         tcIds: z.array(z.string()).optional().describe('add_testcases / remove_testcases: test case ids or codes.'),
+        testCases: z.array(z.object({
+          tcId: z.string().describe('Test case id or business key.'),
+          versionId: z.string().optional().describe('Pin this version id (from the TC versions[]).'),
+          version: z.string().optional().describe('Pin this version NAME (e.g. "v2.0"); ignored when versionId is given.'),
+        })).optional().describe('add_testcases: test cases with an explicit version — lets one TC be added once per version (v1.0 AND v2.0).'),
+        versionId: z.string().optional().describe('add_testcases: pin ONE version for every tcIds entry (id or name `version`). Omit = current version.'),
+        version: z.string().optional().describe('add_testcases: pin one version by NAME for every tcIds entry (e.g. v2.0).'),
         suiteIds: z.array(z.string()).optional().describe('add_testcases: suites whose test cases to add.'),
         assignTo: z.string().optional().describe('add_testcases: user id, or "me".'),
         assignDate: z.string().optional().describe('add_testcases: YYYY-MM-DD.'),
@@ -148,20 +159,19 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
         }
         if (action === 'stack_setup') {
           if (!adapter.configurePlanStacks) return err('execution_plan stack_setup is not available on this connection.');
-          if (!planId) return err('execution_plan action:"stack_setup" needs: planId and stacks.');
-          if (!args.stacks || args.stacks < 1) return err('execution_plan action:"stack_setup" needs: stacks (how many, at least 1).');
+          if (!planId) return err('execution_plan action:"stack_setup" needs: planId and stacks (or stackConfigs).');
+          if (!args.stackConfigs?.length && (!args.stacks || args.stacks < 1)) {
+            return err('execution_plan action:"stack_setup" needs: stacks (how many, at least 1) or stackConfigs (one entry per stack).');
+          }
           const res = await adapter.configurePlanStacks(planId, {
-            count: args.stacks,
+            ...(args.stacks ? { count: args.stacks } : {}),
+            ...(args.stackConfigs?.length ? { stackConfigs: args.stackConfigs } : {}),
             ...(args.stackMode ? { mode: args.stackMode === 'cloud' ? 'CLOUD' as const : 'LOCAL' as const } : {}),
             ...(args.browser ? { browser: args.browser } : {}),
+            ...(args.append ? { append: true } : {}),
           });
           return ok(
-            `${res.created ? 'Saved' : 'Updated'} the stack setup for ${planId}: ${res.stacks.length} stack(s).\n` +
-              res.stacks.map((s) => `  • ${s.name} [${s.mode}] — ${s.codes.join(', ') || '(no test cases)'}`).join('\n') +
-              '\nTest cases were distributed across the stacks (round-robin). Run it with mode:"stack".' +
-              (res.cloudAvailable === false
-                ? '\n⚠️ This project has no cloud machine configured, so CLOUD stacks cannot run yet — add one in the project settings, or redo stack_setup with stackMode:"local".'
-                : ''),
+            stackSetupReply(planId, res, 'Run it with execution_plan { action:"run", planId, mode:"stack" }.'),
             res as unknown as Record<string, unknown>,
           );
         }
@@ -174,21 +184,28 @@ export function registerExecutionPlanTools(server: McpServer, deps: ExecutionPla
           const run = await adapter.startExecutionPlanRun(planId, {
             mode,
             ...(args.agentId ? { agentId: args.agentId } : {}),
+            ...(args.browser ? { browser: args.browser } : {}),
           });
           const where = mode === 'local' ? 'locally' : mode === 'remote' ? `on remote agent ${args.agentId}` : mode === 'cloud' ? 'on the cloud' : 'with its stack setup';
+          const defectNote = await autoDefectLogRunNote(adapter, 'plan', planId);
           const lines = [
             `Started ${planId} ${where} — run ${run.runId} with ${run.started.length} test case${run.started.length === 1 ? '' : 's'}: ${run.started.join(', ')}.`,
             ...(run.skipped.length ? [`Not run: ${run.skipped.map((s) => `${s.code} (${s.reason})`).join(', ')}.`] : []),
             `Track it with run_status({ runId: "${run.runId}" }).`,
+            ...(defectNote ? [defectNote] : []),
           ];
           return ok(lines.join('\n'), { runId: run.runId, started: run.started, skipped: run.skipped });
         }
         if (action === 'add_testcases') {
-          if (!planId || (!args.tcIds?.length && !args.suiteIds?.length)) {
-            return err('execution_plan action:"add_testcases" needs: planId and tcIds or suiteIds.');
+          if (!planId || (!args.tcIds?.length && !args.suiteIds?.length && !args.testCases?.length)) {
+            return err('execution_plan action:"add_testcases" needs: planId and tcIds, testCases or suiteIds.');
           }
           const input: PlanEntryInput = {
-            ...(args.tcIds?.length ? { tcIds: args.tcIds } : {}), ...(args.suiteIds?.length ? { suiteIds: args.suiteIds } : {}),
+            ...(args.tcIds?.length ? { tcIds: args.tcIds } : {}),
+            ...(args.suiteIds?.length ? { suiteIds: args.suiteIds } : {}),
+            ...(args.testCases?.length ? { testCases: args.testCases } : {}),
+            ...(args.versionId ? { versionId: args.versionId } : {}),
+            ...(args.version ? { version: args.version } : {}),
             ...(args.assignTo ? { assignTo: args.assignTo } : {}), ...(args.assignDate ? { assignDate: args.assignDate } : {}),
           };
           const { added, skipped } = await adapter.addPlanEntries(planId, input);

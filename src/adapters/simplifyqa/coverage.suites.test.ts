@@ -206,7 +206,10 @@ test('updateSuiteMembers applies add/remove/reorder (ids stripped, seq renumbere
       id: '300',
       name: 'Smoke',
       executionType: 'LOCAL',
-      members: [{ tcId: '13', order: 1 }, { tcId: '55', order: 2 }],
+      members: [
+        { tcId: '13', order: 1, version: 'v1.0', versionId: 'v13' },
+        { tcId: '55', order: 2, version: 'v1.0', versionId: 'v55' },
+      ],
     });
   }
   {
@@ -697,8 +700,9 @@ test('createSchedule writes the scheduler form body for a TC and a suite, and re
     expect(body.schedulerType).toBe('SU');
     expect(body.parentId).toBe(300);
     expect(body.parentVersionId).toBeUndefined();
+    // a CLOUD schedule: the web test cases get the cloud (headless) browser
     expect(body.platForm).toEqual([
-      { id: 'CHROME', name: 'CHROME', type: 'NONE', technologyType: 'WEB' },
+      { id: 'CHROME_HEADLESS', name: 'CHROME_HEADLESS', type: 'NONE', technologyType: 'WEB' },
       { id: 'API', name: 'API', type: 'NONE', technologyType: 'API' },
     ]);
     expect(body.executionStyle).toBe('');
@@ -743,7 +747,7 @@ test('updateSchedule rebuilds the recurrence, controlSchedule cancels, and delet
     startDate: '2026-02-10T09:00:00.000Z', endDate: '2026-12-10T09:00:00.000Z',
     interval: 1, daysOfWeek: [], dayOfMonth: 10, occurencePosition: '',
   });
-  expect(body.platForm).toEqual([{ id: 'EDGE', name: 'EDGE', type: 'NONE', technologyType: 'WEB' }]);
+  expect(body.platForm).toEqual([{ id: 'EDGE_HEADLESS', name: 'EDGE_HEADLESS', type: 'NONE', technologyType: 'WEB' }]);   // switched to cloud → the cloud browser
   expect(body.executionMode).toBe('cloud');
   expect(body.nextRecurrenceTime).toBeNull();
   expect(body.updateVersion).toBe(2);

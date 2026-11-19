@@ -121,7 +121,10 @@ describe('running the plan', () => {
   test('cloud run needs a configured cloud machine; with one it asks for that machine type', async () => {
     await expect(backend({ cloud: [] }).a.startExecutionPlanRun('PL-68', { mode: 'cloud' })).rejects.toThrow(/No cloud machine/);
     const { a, writes } = backend({ cloud: [{ online: true, cloudType: 'KUBERNETES' }] });
-    await a.startExecutionPlanRun('PL-68', { mode: 'cloud' });
+    // the plan's saved browsers are local ones, so a cloud run asks for the cloud browser first (and writes nothing)
+    await expect(a.startExecutionPlanRun('PL-68', { mode: 'cloud' })).rejects.toThrow(/ASK the user which browser/);
+    expect(writes).toEqual([]);
+    await a.startExecutionPlanRun('PL-68', { mode: 'cloud', browser: 'chrome' });
     const body = runBody(writes);
     expect([body.mode, body.cloudType, body.agentId, body.executionItems.length]).toEqual(['CLOUD', 'KUBERNETES', null, 4]);
   });

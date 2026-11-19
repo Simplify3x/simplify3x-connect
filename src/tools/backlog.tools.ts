@@ -789,17 +789,17 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
   server.registerTool(
     'backlog_link',
     {
-      title: 'Link an epic / feature / user story to another item (Linkages)',
+      title: 'Link an epic / feature / user story / defect to another item (Linkages)',
       description:
-        'Create a LINK between an epic, feature or user story and another backlog item (defect, epic, ' +
+        'Create a LINK between an epic, feature, user story or DEFECT and another backlog item (defect, epic, ' +
         'feature, story, task) — the UI\'s Linkages section. `linkType` is a link type name/key such as ' +
         '"Clones" (case-insensitive; the available types are read from the project\'s link-type config ' +
         'and an unknown one is refused with the list). `destType` is the DESTINATION issue type ' +
         '(e.g. "defect"). The link is saved on the SOURCE item and read back from /pm/linkages to confirm.',
       annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
-        sourceType: z.enum(['epic', 'feature', 'userstory']).describe('Item that owns the Linkages section.'),
-        sourceId: z.string().describe('Source item id or business key (EP-64, FT-266, US-1326).'),
+        sourceType: z.enum(['epic', 'feature', 'userstory', 'defect']).describe('Item that owns the Linkages section (a defect too — its Linkages section).'),
+        sourceId: z.string().describe('Source item id or business key (EP-64, FT-266, US-1326, DE-75).'),
         destType: z.enum(['epic', 'feature', 'userstory', 'defect', 'task']).describe('Destination issue type.'),
         destId: z.string().describe('Destination id or business key (DE-2293).'),
         linkType: z.string().min(1).describe('Link type name or key, e.g. "Clones".'),
@@ -812,7 +812,9 @@ export function registerBacklogTools(server: McpServer, deps: BacklogToolsDeps):
       try {
         const res = await adapter.linkBacklogItem({ sourceType, sourceId, destType, destId, linkType });
         return ok(
-          `Linked ${sourceType} ${sourceId} → ${destType} ${res.destinationCode ?? destId} (${linkType}, key ${res.linkTypeKey}). ` +
+          (res.alreadyLinked
+            ? `${sourceType} ${sourceId} was already linked to ${destType} ${res.destinationCode ?? destId} (${linkType}) — nothing changed. `
+            : `Linked ${sourceType} ${sourceId} → ${destType} ${res.destinationCode ?? destId} (${linkType}, key ${res.linkTypeKey}). `) +
           `Links now: ${res.linkedIssues.map((l) => `${l['destinationCode'] ?? l['destinationId']} (${l['linkTypeKey']})`).join(', ') || '(none)'}`,
           { sourceType, sourceId, destType, destId, linkTypeKey: res.linkTypeKey, links: res.linkedIssues } as unknown as Record<string, unknown>,
         );

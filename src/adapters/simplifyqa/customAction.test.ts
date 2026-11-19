@@ -26,8 +26,7 @@ const tcOf = (steps: any[]) => ({ title: 't', priority: 'medium', category: 'aut
 const step = (actionType: string, over: Record<string, unknown> = {}) =>
   ({ n: 1, description: 'custom', stepType: 'web', actionType, ...over });
 
-describe('custom-method actions missing from the bulk catalog', () => {
-  test('an existing step carrying the numeric action id resolves (edit of the test case is not refused)', async () => {
+describe('custom-method actions missing from the bulk catalog', () => {  test('an existing step carrying the numeric action id resolves (edit of the test case is not refused)', async () => {
     const { a, gets } = adapter();
     const [r] = await a.resolveAutomationSteps(40, 7, tcOf([step('994', { sourceId: 's38' })]));
     expect(r.actionId).toBe(994);
@@ -47,5 +46,23 @@ describe('custom-method actions missing from the bulk catalog', () => {
     const err = await a.resolveAutomationSteps(40, 7, tcOf([step('99999')])).catch((e: Error) => e);
     expect(err.message).toMatch(/not found in the action list/);
     expect(err.message).not.toMatch(/Project not found/);
+  });
+
+  test('an EXISTING step is preserved even when no search can find its action', async () => {
+    const a: any = Object.create(SimplifyQaAdapter.prototype);
+    a.requireProjectId = () => 40;
+    a.http = {
+      postJson: async (path: string) => {
+        if (path !== '/tm/action/search') throw new Error(`unexpected ${path}`);
+        return { data: [] }; // neither the bulk catalog nor a targeted search finds it
+      },
+      getJson: async () => { throw new Error('must never GET /tm/action/:id'); },
+    };
+    const [r] = await a.resolveAutomationSteps(40, 7, tcOf([step('994', { sourceId: 's38', sourceObjectId: '1107' })]));
+    expect(r).toEqual({ actionId: 994, objectId: undefined });
+
+    // …but a NEW step still fails loudly (a typo must never create a phantom action).
+    const err = await a.resolveAutomationSteps(40, 7, tcOf([step('99999')])).catch((e: Error) => e);
+    expect(err.message).toMatch(/not found in the action list/);
   });
 });
