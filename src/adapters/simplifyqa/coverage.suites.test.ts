@@ -913,7 +913,7 @@ test('pipelines: create (TC and SU), update, preview, start/status/stop and dele
     name: 'suite nightly', pipelineType: 'SU', parentId: '300', releaseId: '3', sprintId: '4', mode: 'cloud',
   })).toEqual({ id: '9', code: 'PIP-9', created: true });
   expect(byPath(calls, 'POST', '/pl/pipelines')[1]!.body).toMatchObject({
-    pipelineType: 'SU', parentId: 300, platForm: [{ id: 'CHROME', name: 'CHROME', type: 'NONE', technologyType: 'WEB' }], executionStyle: '',
+    pipelineType: 'SU', parentId: 300, platForm: [{ id: 'CHROME_HEADLESS', name: 'CHROME_HEADLESS', type: 'NONE', technologyType: 'WEB' }], executionStyle: '',
   });
   expect(byPath(calls, 'POST', '/pl/pipelines')[1]!.body.parentVersion).toBeUndefined();
   await adapter.updatePipeline('9', { name: 'renamed', releaseId: '5', sprintId: '6', mode: 'cloud', agentId: 'agent-1' });

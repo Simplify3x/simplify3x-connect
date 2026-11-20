@@ -81,13 +81,13 @@ describe('tc_run refusal cascade', () => {
         name: 'tc_run',
         arguments: {
           tcId: '42', when: 'immediate', mode: 'local', releaseId: 'R_9',
-          sprintId: '', environment: 'qa', browser: 'chromium',
+          sprintId: '', environment: 'qa', browser: 'chromium', strategy: 'serial',
         },
       });
       expect(res.isError).toBeFalsy();
       // Skipped release/sprint/version values are omitted, not sent as empty strings.
       expect(startRun).toHaveBeenCalledWith({ tcId: '42' }, {
-        mode: 'local', environment: 'qa', browser: 'chromium', releaseId: 'R_9',
+        mode: 'local', strategy: 'serial', environment: 'qa', browser: 'chromium', releaseId: 'R_9',
       });
       expect(textOf(res)).toContain('Started 42 locally on your online agent. Run id `run-1`');
       expect(textOf(res)).toContain('Report: https://qa/runs/run-1');
@@ -102,6 +102,7 @@ describe('tc_run refusal cascade', () => {
     const listCloudRunners = jest.fn(async () => [runner({ id: 'cr-1', name: 'Cloud VM 1' })]);
     const base = {
       tcId: '42', when: 'immediate', mode: 'cloud', releaseId: '', environment: 'qa', browser: 'chromium',
+      strategy: 'serial',
     };
     // Round 1: nothing online.
     const none = await connect({ ...NO_AGENT, getTestCase: async () => webTc, startRun, listCloudRunners: async () => [runner({ online: false })] } as unknown as ProviderAdapter);
@@ -125,7 +126,7 @@ describe('tc_run refusal cascade', () => {
       const res = await client.callTool({ name: 'tc_run', arguments: { ...base, cloudRunnerId: 'cr-1' } });
       expect(res.isError).toBeFalsy();
       expect(startRun).toHaveBeenCalledWith({ tcId: '42' }, {
-        mode: 'cloud', environment: 'qa', browser: 'chromium', cloudRunnerId: 'cr-1', cloudType: 'aws',
+        mode: 'cloud', strategy: 'serial', environment: 'qa', browser: 'chromium', cloudRunnerId: 'cr-1', cloudType: 'aws',
       });
       expect(textOf(res)).toContain('Started 42 on cloud runner **Cloud VM 1**. Run id `run-cloud`');
     } finally {
@@ -145,6 +146,7 @@ describe('tc_run refusal cascade', () => {
     try {
       const base = {
         tcId: '42', when: 'immediate', mode: 'remote', releaseId: '', environment: 'qa', browser: 'chromium',
+        strategy: 'serial',
       };
       const noAgent = await client.callTool({ name: 'tc_run', arguments: base });
       expect(noAgent.isError).toBe(true);
@@ -160,7 +162,7 @@ describe('tc_run refusal cascade', () => {
       const ownMachine = await client.callTool({ name: 'tc_run', arguments: { ...base, agentId: 'cred-mine' } });
       expect(ownMachine.isError).toBeFalsy();
       expect(startRun).toHaveBeenCalledWith({ tcId: '42' }, {
-        mode: 'remote', agentId: 'cred-mine', environment: 'qa', browser: 'chromium',
+        mode: 'remote', strategy: 'serial', agentId: 'cred-mine', environment: 'qa', browser: 'chromium',
       });
     } finally {
       await client.close();

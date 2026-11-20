@@ -50,7 +50,7 @@ describe('tc_run reuse-config prompt', () => {
     registerRunTools(cap.server, { getAdapter: () => adapter, getProjectId: () => 'proj-alpha-1' });
 
     const res = await cap.get('tc_run')({
-      tcId: '42', when: 'immediate', mode: 'local',
+      tcId: '42', when: 'immediate', mode: 'local', strategy: 'serial',
       releaseId: '', sprintId: '', environment: 'qa', browser: 'chromium',
     });
     expect(res.isError).toBeFalsy();
@@ -66,7 +66,7 @@ describe('tc_run reuse-config prompt', () => {
     registerRunTools(cap.server, { getAdapter: () => adapter, getProjectId: () => 'proj-alpha-2' });
 
     await cap.get('tc_run')({
-      tcId: '42', when: 'immediate', mode: 'local',
+      tcId: '42', when: 'immediate', mode: 'local', strategy: 'serial',
       releaseId: 'R_9', sprintId: 'SP_1', environment: 'staging', browser: 'firefox',
     });
     // Second call: only tcId — should refuse and quote the remembered summary.
@@ -93,7 +93,7 @@ describe('tc_run reuse-config prompt', () => {
     registerRunTools(cap.server, { getAdapter: () => adapter, getProjectId: () => 'proj-alpha-3' });
 
     await cap.get('tc_run')({
-      tcId: '42', when: 'immediate', mode: 'local',
+      tcId: '42', when: 'immediate', mode: 'local', strategy: 'serial',
       releaseId: 'R_9', sprintId: 'SP_1', environment: 'staging', browser: 'firefox',
     });
 
@@ -105,7 +105,7 @@ describe('tc_run reuse-config prompt', () => {
     expect(startRunCalls).toHaveLength(1); // the refusal did not start a run
 
     // Supplying the freshly-asked environment lets the reused config run.
-    const res = await cap.get('tc_run')({ tcId: '42', reuseConfig: true, environment: 'qa' });
+    const res = await cap.get('tc_run')({ tcId: '42', reuseConfig: true, environment: 'qa', strategy: 'serial' });
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toMatch(/run-b/);
     // Verify the merge landed on startRun's opts (remembered fields + the newly asked environment).
@@ -127,7 +127,7 @@ describe('tc_run reuse-config prompt', () => {
     registerRunTools(cap.server, { getAdapter: () => adapter, getProjectId: () => 'proj-alpha-4' });
 
     await cap.get('tc_run')({
-      tcId: '42', when: 'immediate', mode: 'local',
+      tcId: '42', when: 'immediate', mode: 'local', strategy: 'serial',
       releaseId: 'R_9', sprintId: 'SP_1', environment: 'staging', browser: 'firefox',
     });
     // reuseConfig: false + nothing else → should fall through to the `when` refusal (cascade start).
@@ -147,7 +147,7 @@ describe('tc_run reuse-config prompt', () => {
 
     // Pass release='', omit sprintId — should not refuse on sprint.
     const res = await cap.get('tc_run')({
-      tcId: '42', when: 'immediate', mode: 'local',
+      tcId: '42', when: 'immediate', mode: 'local', strategy: 'serial',
       releaseId: '', environment: 'qa', browser: 'chromium',
     });
     expect(res.isError).toBeFalsy();

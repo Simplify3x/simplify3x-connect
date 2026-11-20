@@ -54,7 +54,7 @@ describe('tc_run version refusal', () => {
     registerRunTools(cap.server, { getAdapter: () => adapter });
 
     const res = await cap.get('tc_run')({
-      tcId: '42', mode: 'cloud', when: 'immediate',
+      tcId: '42', mode: 'cloud', when: 'immediate', strategy: 'serial',
       releaseId: '', sprintId: '', environment: 'general', browser: 'chromium',
       // versionId deliberately omitted
     });
@@ -80,7 +80,7 @@ describe('tc_run version refusal', () => {
     registerRunTools(cap.server, { getAdapter: () => adapter });
 
     const res = await cap.get('tc_run')({
-      tcId: '42', mode: 'local', when: 'immediate',
+      tcId: '42', mode: 'local', when: 'immediate', strategy: 'serial',
       releaseId: '', sprintId: '', environment: 'general', browser: 'chromium',
       // No agentId → tool skips the online-check and calls startRun directly (auto-pick path).
     });

@@ -1,6 +1,6 @@
 {
   "name": "simplify3x-connect",
-  "version": "0.31.3",
+  "version": "0.31.9",
   "mcpName": "com.simplifyqa/simplify3x-connect",
   "type": "module",
   "description": "Simplify3x Connect: one product-neutral MCP for the QA test-case lifecycle. Drives SimplifyQA from any AI client over stdio or HTTP.",

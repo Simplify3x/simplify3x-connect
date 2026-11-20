@@ -135,7 +135,7 @@ describe('refused before the backend can answer "Error While Creating Task"', ()
     await expect(a.createTask({ name: 'huge', estimatedEffort: 10000 })).rejects.toThrow(/between 0 and 9999/);
     await expect(a.createTask({ name: 'bad type', estimatedEffort: 1, type: 'Banana' })).rejects.toThrow(/not a task type.*Bug fix, Development/s);
     await expect(a.createTask({ name: 'bad date', estimatedEffort: 1, plannedStartDate: '17/11/2026' })).rejects.toThrow(/must be a date like/);
-    await expect(a.createTask({ name: 'bad range', estimatedEffort: 1, plannedStartDate: '2026-12-05', plannedEndDate: '2026-12-01' })).rejects.toThrow(/on or after plannedStartDate/);
+    await expect(a.createTask({ name: 'bad range', estimatedEffort: 1, plannedStartDate: '2026-12-05', plannedEndDate: '2026-12-01' })).rejects.toThrow(/must be after the planned start date/);
     await expect(a.createTask({ name: 'who', estimatedEffort: 1, assignee: 'nobody@nowhere.com' })).rejects.toThrow(/No user matches/);
     expect(posts).toEqual([]);
   });

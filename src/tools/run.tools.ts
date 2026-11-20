@@ -101,7 +101,7 @@ const SCHEDULE_TYPE_DESC =
  *  only Walnut's scheduler is limited to the Playwright set. */
 const SCHEDULE_BROWSER_NOTE =
   "For a SCHEDULE on SimplifyQA, 'chrome' (and 'chromium') = Chrome, 'msedge'/'edge' = Edge, 'firefox', 'webkit'/'safari' = Safari — chrome is fine; " +
-  "on Walnut a schedule accepts only chromium/msedge/firefox/webkit.";
+  "on Walnut a schedule accepts only chromium/msedge/firefox/webkit. A schedule whose mode is CLOUD is headless too: offer only Chrome Headless / Firefox Headless / Edge Headless there.";
 /** On the CLOUD the browser choice is the cloud picker's: Chrome / Firefox / Edge Headless, not the local list. */
 const CLOUD_BROWSER_NOTE =
   "ON THE CLOUD (mode 'cloud') the ONLY choices are Chrome Headless, Firefox Headless and Edge Headless (pass 'chrome', 'firefox' or 'edge' — each means its headless one); " +
@@ -513,12 +513,18 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
         "  • 'cloud' — an online cloud runner VM (ONLINE-only whether now or scheduled). Pass `cloudRunnerId` " +
         'from cloud_runners; for a schedule omit it to let the backend auto-pick a live VM at fire time.\n' +
         'For cloud, if no runner is online it reports that there are no active cloud runners (nothing is run).\n' +
-        'NOTE: MANUAL test cases cannot be run or scheduled by an agent — the backend rejects them.',
+        "NOTE: MANUAL test cases cannot be run or scheduled by an agent — the backend rejects them.\n" +
+        "IMMEDIATE RUNS ALSO ASK `strategy`: SERIAL or PARALLEL — the UI's PARALLEL/SERIAL radio above Release " +
+        "(local, remote and cloud alike); the tool refuses an immediate run that does not say. A single test case " +
+        "normally runs SERIAL; PARALLEL is a multi-device run (pass `devices`). A schedule does not ask it.",
       inputSchema: {
         tcId: z.string().describe('The test case id (or business key) to run.'),
         reuseConfig: z.boolean().optional().describe("Set only when the tool refused asking about REUSE. true = merge the previous run's mode/release/sprint/browser/agent/runner into any unset field; the ENVIRONMENT is never merged — it is asked on every run; false = ignore prior config and walk the full cascade. Omit on a first run."),
         when: z.enum(['immediate', 'schedule']).optional().describe("STEP 1 — when to run. REQUIRED, ASK the user if unstated (the tool refuses when omitted). 'immediate' dispatches now; 'schedule' creates a schedule (needs scheduledFor)."),
         mode: z.enum(['local', 'remote', 'cloud']).optional().describe("STEP 2 — where to run. REQUIRED, ASK the user if unstated."),
+        strategy: z.enum(['serial', 'parallel']).optional().describe(
+          "STEP 3 (IMMEDIATE runs) — SERIAL or PARALLEL: the same PARALLEL/SERIAL radio the UI's Execute dialog shows above Release (it applies to LOCAL, REMOTE and CLOUD alike). ASK the user; the tool refuses an immediate run that does not say. A single test case normally runs SERIAL; PARALLEL is a multi-device run (pass `devices`). Schedules do not ask it.",
+        ),
         releaseId: z.string().optional().describe("STEP 3 — tag the run with a RELEASE (from list_releases). Optional in the UI; pass '' after asking to skip. The tool refuses when undefined so the user is asked."),
         sprintId: z.string().optional().describe("STEP 4 — tag the run with a SPRINT (from list_sprints, scoped to release). Only asked when releaseId is non-empty; skipped entirely when releaseId=''. Pass '' after asking to skip."),
         versionId: z.string().optional().describe("STEP 5 — override the TC's currently-selected VERSION for this run (an id or name from the TC's `versions[]`). Pass '' to accept the TC's current version."),
@@ -551,7 +557,7 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ tcId, reuseConfig, when, mode, agentId, environment, browser, headless, cloudRunnerId, deviceId, deviceName: deviceNameArg, deviceType, cloudDeviceType, osVersion, devices, scheduledFor, scheduleType, endDate, timezone, scheduleName, interval, daysOfWeek, dayOfMonth, occurrence, releaseId, sprintId, versionId }) => {
+    async ({ tcId, reuseConfig, when, mode, agentId, environment, browser, headless, cloudRunnerId, deviceId, deviceName: deviceNameArg, deviceType, cloudDeviceType, osVersion, devices, scheduledFor, scheduleType, endDate, timezone, scheduleName, interval, daysOfWeek, dayOfMonth, occurrence, releaseId, sprintId, versionId, strategy }) => {
       let deviceName = deviceNameArg;
       const adapter = deps.getAdapter();
       if (!adapter) return err(NOT_CONNECTED);
@@ -825,8 +831,20 @@ export function registerRunTools(server: McpServer, deps: RunToolsDeps): void {
         }
       }
 
+      // The UI's Execute dialog shows a PARALLEL/SERIAL radio above Release; ask it for every
+      // immediate run (a schedule does not carry one).
+      if (!isMultiDevice && !strategy) {
+        return err(
+          'ASK the user whether this run should be SERIAL or PARALLEL — the PARALLEL/SERIAL radio the ' +
+            "UI's Execute dialog shows above Release (it applies to local, remote and cloud). For one test " +
+            'case SERIAL is the usual choice; PARALLEL is a multi-device run (pass `devices`). Then call ' +
+            "tc_run again with strategy:'serial' or strategy:'parallel'.",
+        );
+      }
+
       const opts: RunOptions = {
         mode,
+        ...(!isMultiDevice && strategy ? { strategy } : {}),
         ...((mode === 'local' || mode === 'remote') && agentId ? { agentId } : {}),
         ...(environment !== undefined ? { environment } : {}),
         ...(browser !== undefined ? { browser } : {}),

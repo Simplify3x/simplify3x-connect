@@ -8,12 +8,12 @@
     "url": "https://github.com/Simplify3x/simplify3x-connect",
     "source": "github"
   },
-  "version": "0.31.3",
+  "version": "0.31.9",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "simplify3x-connect",
-      "version": "0.31.3",
+      "version": "0.31.9",
       "transport": {
         "type": "stdio"
       },

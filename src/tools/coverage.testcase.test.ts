@@ -136,6 +136,25 @@ describe('tc_save — draft path', () => {
       expect(tokenedSave.isError).toBe(true);
       expect(textOf(tokenedSave)).toContain('these step tokens have no resolvable value: step 1: ${username}');
       expect(createTestCase).not.toHaveBeenCalled();
+
+      // A RECORDED value lives in recordedParam, not in `data`/`value` — it must satisfy the check
+      // (the save builder binds it and the backend writes it into the default test-data row). Without
+      // this the recorded step was refused and its parameter landed with an empty test-data cell.
+      const recorded = await client.callTool({
+        name: 'tc_draft_create',
+        arguments: {
+          title: 'Recorded token',
+          category: 'automated',
+          steps: [{
+            description: 'Click ${lob_name}', actionType: 'Click', stepType: 'web',
+            objectRef: { id: '198' }, recordedParam: { lob_name: 'Medical-FI' },
+          }],
+        },
+      });
+      const recordedId = structured<{ draftId: string }>(recorded).draftId;
+      const recordedSave = await client.callTool({ name: 'tc_save', arguments: { draftId: recordedId } });
+      expect(textOf(recordedSave)).not.toContain('no resolvable value');
+      expect(createTestCase).toHaveBeenCalledTimes(1);
     } finally {
       await client.close();
       await server.close();

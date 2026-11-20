@@ -9,7 +9,7 @@ import type { StackSetupResult } from '../adapters/simplifyqa/adapter.js';
 
 export const stackConfigsSchema = z.array(z.object({
   mode: z.enum(['local', 'remote', 'cloud']).optional().describe('Where THIS stack runs (default: stackMode, else cloud).'),
-  browser: z.string().optional().describe('Browser for the WEB test cases on this stack: chrome, firefox, edge, safari (cloud stacks are headless: Chrome / Firefox / Edge Headless). Default chrome.'),
+  browser: z.string().optional().describe('Browser for the WEB test cases on this stack. LOCAL / REMOTE stacks: chrome, firefox, edge, safari (and their headless / incognito variants). A CLOUD stack offers ONLY Chrome Headless, Firefox Headless or Edge Headless — pass chrome / firefox / edge and it is that headless one; any other value is refused with those three. Default chrome (its headless one on a cloud stack).'),
   agentId: z.string().optional().describe('REMOTE stacks only, required: the machine to run on — its id or machine name (see local_agents / remote_agents).'),
   testCases: z.array(z.string()).optional().describe('Test cases (TC-39 or id) to put on THIS stack. Name them for every stack, or for none (then they are spread evenly).'),
 })).optional().describe(

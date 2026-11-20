@@ -275,6 +275,10 @@ export interface ProviderAdapter {
    *  or the persisted steps when no seed exists) — the read side of journal-first editing. Absent on
    *  providers with no recording journal. */
   readJournal?(tcId: string, versionId?: string): Promise<JournalView>;
+  /** Delete the blank placeholder step rows a save may have stored (the editor seeds one for a NEW
+   *  test case). Used after the recorder window's own Save, which the MCP cannot build itself.
+   *  Returns what it removed and the remaining step count; a no-op when there are no blanks. */
+  dropEmptySteps?(tcId: string): Promise<{ removed: number; removedSeqs: number[]; stepCount: number }>;
   /** Walnut-only: apply granular modify ops (add/remove/update/move step, wrap in loop/if, insert
    *  nested) to a test case and persist — the write side of journal-first editing. SimplifyQA also
    *  takes `versionId` (a version id or name) to read/edit a version other than the current one. */

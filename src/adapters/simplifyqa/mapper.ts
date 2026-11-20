@@ -839,6 +839,9 @@ function withSavedTcFields(tcfnObj: Record<string, unknown>, tc: TestCase): Reco
   // Neutral fields the caller can legitimately CHANGE (journal_modify set_meta) must win over the
   // copied raw doc — otherwise editing tags/… looks successful but the old value is re-sent.
   if (tc.tags !== undefined) merged['tags'] = tc.tags;
+  // The caller naming a technology wins over the copied raw doc (a MANUAL test case keeps its type on
+  // edit; without this the raw `tcType` re-sent would silently keep the old technology).
+  if (tc.technologyType) merged['tcType'] = tc.technologyType.toUpperCase();
   return merged;
 }
 
@@ -1204,6 +1207,61 @@ function currentVersionFor(tc: TestCase): { id?: string; name?: string; updateVe
   return v ? { id: v.id, name: v.name, ...(typeof v.updateVersion === 'number' ? { updateVersion: v.updateVersion } : {}) } : {};
 }
 
+/** Step kinds a BLANK placeholder row can carry. Any other stepType (IF_END, FUNCTION_END, API,
+ *  SWITCH_TO_*, …) is structural and legitimately has an empty description. */
+const BLANK_STEP_TYPES = new Set([
+  '', 'NORMAL_STATEMENT',
+  // neutral (draft) step types — a fresh row is seeded with the test case's technology
+  'WEB', 'MANUAL', 'API', 'DATABASE', 'MAINFRAME', 'ANDROID', 'IOS', 'DESKTOP', 'SAP',
+]);
+
+/**
+ * Is this step an EMPTY PLACEHOLDER rather than a real step?
+ *
+ * The test-case editor seeds a new test case with one blank row before anything is recorded
+ * (`new_ui` steps.component.ts ngOnInit → `steps = [this.defaultStepObj]`, description '' /
+ * actionId null), and the recorder window's own Save can carry that row through. The backend
+ * accepts it, so a 1-step recording lands with 2 steps (DE-2320: "1 step in SCRPY, 2 in the UI
+ * after save"). Such a row has no text, no action, no object, no data — it can never execute
+ * anything, so it must never be written, re-saved, or counted.
+ *
+ * Works on BOTH shapes: a neutral `Step` (actionType '') and a raw SQA row (actionId/objectId).
+ */
+export function isBlankStep(step: unknown): boolean {
+  if (!step || typeof step !== 'object') return false;
+  const s = step as Record<string, any>;
+  if (s['deleted'] === true) return false;
+  if (!BLANK_STEP_TYPES.has(String(s['stepType'] ?? '').toUpperCase())) return false;
+  if (String(s['description'] ?? '').trim()) return false;
+  if (String(s['expectedResult'] ?? '').trim()) return false;
+  if (String(s['actionType'] ?? '').trim()) return false;
+  if (s['actionId'] != null && s['actionId'] !== '') return false;
+  if (s['objectId'] != null && s['objectId'] !== '') return false;
+  if (s['objectRef']) return false;
+  if (s['api'] || s['apiData']) return false;
+  if (s['functionCall'] || (s['functionId'] != null && s['functionId'] !== '')) return false;
+  if (s['controlFlow']) return false;
+  const conditions = s['conditions'];
+  if (conditions && typeof conditions === 'object' && String(conditions.ifstring ?? '').trim()) return false;
+  for (const key of ['parameterIds', 'objectParameterIds']) {
+    const ids = s[key];
+    if (Array.isArray(ids) && ids.length) return false;
+  }
+  if (s['value'] != null && String(s['value']).trim()) return false;
+  if (s['recordedParam'] && typeof s['recordedParam'] === 'object'
+    && Object.values(s['recordedParam']).some((v) => String(v ?? '').trim())) return false;
+  return true;
+}
+
+/** Drop blank placeholder rows before a save. A save with ONLY blanks is left untouched so the
+ *  caller's own validation/message still fires instead of silently producing an empty test case. */
+export function withoutBlankSteps<T extends { steps?: Step[] | undefined }>(tc: T): T {
+  const steps = tc.steps ?? [];
+  const kept = steps.filter((s) => !isBlankStep(s));
+  if (kept.length === steps.length || kept.length === 0) return tc;
+  return { ...tc, steps: kept };
+}
+
 /**
  * Assemble the `testcaseObj` payload for POST/PUT /tm/testcase (multipart). Branches on
  * `tc.category`: manual → `steps.manualSteps` (legacy behavior), automated → `steps.automationSteps`
@@ -1227,6 +1285,16 @@ export function buildTestcasePayload(inputs: BuildTestcasePayloadInputs): Record
 function buildManualPayload(inputs: BuildTestcasePayloadInputs): Record<string, unknown> {
   const { projectId, moduleId, userstoryId, existingId, tc, paramIdByName } = inputs;
 
+  // A MANUAL test case still has a technology — the form's Type/Technology, which the UI shows as the
+  // test case's tech (Desktop, Android, iOS, API …). Honour what the caller asked for instead of
+  // forcing WEB; an unknown value is refused rather than silently saved as WEB.
+  const requestedTech = (tc.technologyType ?? '').trim().toUpperCase();
+  const MANUAL_TECHS = ['WEB', 'API', 'ANDROID', 'IOS', 'DATABASE', 'MAINFRAME', 'DESKTOP', 'SAP'];
+  if (requestedTech && !MANUAL_TECHS.includes(requestedTech)) {
+    throw new Error(`Unknown technology "${tc.technologyType}" for a manual test case — use one of: ${MANUAL_TECHS.join(', ')}.`);
+  }
+  const tcType = requestedTech || 'WEB';
+
   // ponytail: emit the same field set as the SQA UI payload, always — validators + $set on the
   // backend depend on presence, even for empty defaults. Loader-mutator-saver semantics.
   const tcfnObj: Record<string, unknown> = {
@@ -1237,7 +1305,7 @@ function buildManualPayload(inputs: BuildTestcasePayloadInputs): Record<string, 
     suiteId: [] as number[],
     description: stripParamTokens(normalizeParamTokens(tc.description ?? '') ?? '') ?? '',
     projectId,
-    tcType: 'WEB',
+    tcType,
     executionType: 'MANUAL',
     // Round-trip the flag: an edit/re-save must never silently RESET `obsolete` to false (that used to
     // revive a TC the story sync had retired). Revival is explicit: set_meta { obsolete: false }.
@@ -1757,6 +1825,8 @@ function buildAutomationPayload(inputs: BuildTestcasePayloadInputs): Record<stri
     automationSteps.push(step);
   });
 
+  shareParamValuesAcrossSteps(automationSteps);
+
   return {
     tcfnObj: withSavedTcFields(tcfnObj, tc),
     versionsDetails,
@@ -1764,6 +1834,39 @@ function buildAutomationPayload(inputs: BuildTestcasePayloadInputs): Record<stri
     operation: 'TC',
     type: 'TC',
   };
+}
+
+/** A parameter used by several steps (the same object's attribute on two steps, a reused `${name}`) is ONE test-data
+ *  column. The backend (saveTestData) creates that cell once, on the FIRST step that lists the parameter, and seeds its
+ *  value only from THAT step's `recordedParam` — a value given on a later step is dropped and the column stays empty.
+ *  So when the first step has no value for a shared parameter, take it from the first later step that has one.
+ *  Never overrides a value the first step already carries. */
+export function shareParamValuesAcrossSteps(steps: Array<Record<string, unknown>>): void {
+  const firstOwner = new Map<string, Record<string, unknown>>();
+  for (const s of steps) {
+    if (s['deleted'] || s['functionId']) continue;
+    for (const list of [s['objectParameterIds'], s['parameterIds']]) {
+      if (!Array.isArray(list)) continue;
+      for (const id of list) {
+        const key = String(id);
+        if (!firstOwner.has(key)) firstOwner.set(key, s);
+      }
+    }
+  }
+  for (const s of steps) {
+    if (s['deleted'] || s['functionId']) continue;
+    const rec = s['recordedParam'];
+    if (!rec || typeof rec !== 'object') continue;
+    for (const [key, value] of Object.entries(rec as Record<string, unknown>)) {
+      if (typeof value !== 'string' || value.trim() === '') continue;
+      const owner = firstOwner.get(key);
+      if (!owner || owner === s) continue;
+      const ownerRec = (owner['recordedParam'] && typeof owner['recordedParam'] === 'object'
+        ? owner['recordedParam'] : (owner['recordedParam'] = {})) as Record<string, unknown>;
+      const cur = ownerRec[key];
+      if (typeof cur !== 'string' || cur.trim() === '') ownerRec[key] = value;
+    }
+  }
 }
 
 /** Neutral SavedRef from a POST/PUT /tm/testcase response. Tolerates a bare doc or a `data`-wrapped

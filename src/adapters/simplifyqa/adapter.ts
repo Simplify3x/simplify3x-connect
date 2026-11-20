@@ -41,8 +41,9 @@ import type { HealApplyMode, HealPlan, HealProposeInput, HealReport } from '../.
 import { applyHealPlan as applyHealPlanCore, type HealApplyDeps, type HealTestDataPatch } from './heal/apply.js';
 import type { HealFacts, HealObjectFact } from './heal/plan.js';
 import {
-  applyCollectionSteps, buildTestcasePayload, deriveTcType, extractApiParamNames, extractParamNames, extractValueParamNames, fromSqaStep, isApiRequestStep, runtimeSlotValue,
+  applyCollectionSteps, buildTestcasePayload, deriveTcType, extractApiParamNames, extractParamNames, extractValueParamNames, fromSqaStep, isApiRequestStep, isBlankStep, runtimeSlotValue,
   looksSensitive, normalizeSuiteEntry, notDeleted, numericId, paramDefault, pickArray, str,
+  withoutBlankSteps,
   SUITE_UPDATE_ALLOWED_KEYS, TECH_BY_STEPTYPE,
   toDefectSummary, toEpic, toEpicSummary, toFeature, toFeatureSummary,
   toFunction, toFunctionSummary, toModuleSaved, toModuleSummary, toObject, toImageUrl, toReleaseSummary,
@@ -751,6 +752,23 @@ function testcaseVersion(raw: any, optional = false): { versionId: string; versi
   return { versionId: versionId ?? '', versionName: versionName ?? 'v1.0' };
 }
 
+/** Reject a planned end date that is before the planned start date. The SQA web form blocks this, but
+ *  the backend happily saves it (US-2564 saved 2026-12-10 → 2026-12-01), so the MCP must enforce it on
+ *  every backlog write that takes planned dates. Only checks when both are present in the same call. */
+export function assertPlannedDates(start?: string | null, end?: string | null): void {
+  const s = (start ?? '').trim();
+  const e = (end ?? '').trim();
+  if (!s || !e) return;
+  const day = (v: string): string => {
+    if (!/^\d{4}-\d{2}-\d{2}/.test(v) || Number.isNaN(new Date(v).getTime())) {
+      throw new Error(`Planned dates must look like 2026-12-10 (got "${v}").`);
+    }
+    return v.slice(0, 10);
+  };
+  const [ds, de] = [day(s), day(e)];
+  if (de <= ds) throw new Error(`Planned end date (${de}) must be after the planned start date (${ds}).`);
+}
+
 /** Version for a plan/suite entry: the requested one (id or name), else the test case's current one.
  *  A requested version that does not exist FAILS — silently falling back to v1.0 turned a request for
  *  v2.0 into a duplicate v1.0 row. */
@@ -789,6 +807,36 @@ export type PmBlockers = {
   executionPlans: SuiteRef[]; pipelines: SuiteRef[]; schedules: SuiteRef[]; otherProjects: SuiteRef[];
 };
 export type PmDeletePreview = { kind: 'release' | 'sprint'; record: SuiteRef & { state?: string }; blockers: PmBlockers; callerIsAdmin: boolean };
+/** object_parameterize: make part of a step's object locator a parameter of the object. */
+export type ObjectParameterizeInput = {
+  tcId: string;
+  /** 1-based step number whose object holds the locator. */
+  step: number;
+  parameterName: string;
+  /** The value for the test-data cell (also the locator text to replace unless `replace` is given). */
+  value?: string | undefined;
+  /** The literal text inside the locator that becomes the parameter (e.g. "PIM"). */
+  replace?: string | undefined;
+  /** Only this locator (by name) is rewritten; default = every locator containing the text. */
+  locator?: string | undefined;
+  versionId?: string | undefined;
+  /** Without it nothing is written — the call only reports what would change. */
+  confirm?: boolean | undefined;
+};
+export type ObjectParameterizeResult = {
+  written: boolean;
+  tcId: string;
+  step: number;
+  /** Every step of the test case that uses the object — all of them get the parameter. */
+  steps: number[];
+  objectId: string;
+  objectName: string;
+  parameter: { name: string; id?: number };
+  changes: Array<{ locator: string; before: string; after: string }>;
+  value: string;
+  testdata: 'preview' | 'seeded' | 'patched' | 'not-checked';
+  notes: string[];
+};
 export class PmBlockedError extends Error {
   constructor(readonly kind: 'release' | 'sprint', readonly record: SuiteRef, readonly blockers: PmBlockers) {
     super(`${record.code ?? record.id} is still in use and was not deleted.`);
@@ -2340,6 +2388,7 @@ export class SimplifyQaAdapter {
    *  (type / state / priority from the project's own default values; dates from the sprint, else the release, else today)
    *  and the result says so. */
   async createTask(input: TaskCreateInput): Promise<TaskCreateResult> {
+    assertPlannedDates(input.plannedStartDate, input.plannedEndDate);
     const projectId = this.requireProjectId();
     const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const name = String(input.name ?? '').trim();
@@ -2625,7 +2674,7 @@ export class SimplifyQaAdapter {
       return v ? String(v).slice(0, 10) : undefined;
     };
     const [start, end] = [day('plannedStartDate'), day('plannedEndDate')];
-    if (start && end && end < start) throw new Error(`Planned end date (${end}) must be on or after the planned start date (${start}).`);
+    if (start && end && end <= start) throw new Error(`Planned end date (${end}) must be after the planned start date (${start}).`);
     return { wire, labels };
   }
 
@@ -2829,6 +2878,7 @@ export class SimplifyQaAdapter {
    *  logged from an execution) enforces the project's mandatory custom fields, which it reports in its own words. The User Story and
    *  Test Case fields are set as the form stores them, and each test case is checked to list the defect. */
   async createDefect(input: DefectCreateInput): Promise<DefectCreateResult> {
+    assertPlannedDates(input.plannedStartDate, input.plannedEndDate);
     const projectId = this.requireProjectId();
     const canon = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const name = String(input.name ?? '').trim();
@@ -3324,6 +3374,7 @@ export class SimplifyQaAdapter {
     const defaults = await this.getBacklogDefaults(3);
     const state = input.state ?? defaults.state;
     const priority = input.priority ?? defaults.priority;
+    assertPlannedDates(input.plannedStartDate, input.plannedEndDate);
     const body = {
       ...input,
       // SQA userstory expects a singular numeric projectId; fill from the connected project when omitted.
@@ -3338,6 +3389,7 @@ export class SimplifyQaAdapter {
 
   async updateStory(id: string, patch: StoryUpdate): Promise<SavedRef> {
     const resolvedId = await this.resolveStoryNumericId(id);
+    assertPlannedDates(patch.plannedStartDate, patch.plannedEndDate);
     // The backend's update controller runs its privilege check with `req.body.projectId`; a partial
     // patch that omits it makes that call throw (HTTP 500), which is why a story edit has to carry the
     // project. Default to the connected project — the story being edited belongs to it.
@@ -3619,6 +3671,7 @@ export class SimplifyQaAdapter {
   }
 
   async createEpic(input: EpicInput): Promise<SavedRef> {
+    assertPlannedDates(input.plannedStartDate, input.plannedEndDate);
     const defaults = await this.getBacklogDefaults(1);
     const state = input.state ?? defaults.state;
     const body = {
@@ -3632,6 +3685,7 @@ export class SimplifyQaAdapter {
   }
 
   async updateEpic(id: string, patch: EpicUpdate): Promise<SavedRef> {
+    assertPlannedDates(patch.plannedStartDate, patch.plannedEndDate);
     const resolvedId = await this.resolveEpicNumericId(id);
     const raw = await this.http.putJson<any>(`/pm/epic/${resolvedId}`, patch);
     return toSavedRef(raw ?? { id: resolvedId }, false);
@@ -3684,6 +3738,7 @@ export class SimplifyQaAdapter {
   }
 
   async createFeature(input: FeatureInput): Promise<SavedRef> {
+    assertPlannedDates(input.plannedStartDate, input.plannedEndDate);
     const defaults = await this.getBacklogDefaults(2);
     const state = input.state ?? defaults.state;
     const priority = input.priority ?? defaults.priority;
@@ -3699,6 +3754,7 @@ export class SimplifyQaAdapter {
   }
 
   async updateFeature(id: string, patch: FeatureUpdate): Promise<SavedRef> {
+    assertPlannedDates(patch.plannedStartDate, patch.plannedEndDate);
     const resolvedId = await this.resolveFeatureNumericId(id);
     const raw = await this.http.putJson<any>(`/pm/feature/${resolvedId}`, patch);
     return toSavedRef(raw ?? { id: resolvedId }, false);
@@ -5155,6 +5211,9 @@ export class SimplifyQaAdapter {
    *  multipart with the assembled `testcaseObj`. */
   async createTestCase(tc: TestCase): Promise<SavedRef> {
     const projectId = this.requireProjectId();
+    // A blank placeholder row (the editor seeds one for a NEW test case) is never a step: drop it so
+    // the save can't store a phantom step that doubles the count (DE-2320).
+    tc = withoutBlankSteps(tc);
     await this.pinFunctionCalls(tc);
     await this.resolveFunctionTechnologies(tc);
     const moduleId = await this.resolveModuleId(tc.folderOrModule);
@@ -5179,6 +5238,7 @@ export class SimplifyQaAdapter {
   /** Same shape as create, but with `tcfnObj.id` set. */
   async updateTestCase(id: string, tc: TestCase): Promise<SavedRef> {
     const projectId = this.requireProjectId();
+    tc = withoutBlankSteps(tc);
     await this.pinFunctionCalls(tc);
     await this.resolveFunctionTechnologies(tc);
     const moduleId = await this.resolveModuleId(tc.folderOrModule);
@@ -5230,6 +5290,40 @@ export class SimplifyQaAdapter {
     }
   }
 
+  /**
+   * Remove the blank placeholder step rows a saved test case may carry (DE-2320). The recorder
+   * window's own Save is the one save path the MCP cannot build: the editor pre-seeds a new test
+   * case with an empty row, and that row can be stored, so a 1-step recording shows 2 steps.
+   * Deleting the stored blank rows afterwards makes the test case match what was recorded.
+   * Nothing is touched when the test case has no blanks, and a test case made ONLY of blanks is
+   * left alone (there would be nothing left to save).
+   */
+  async dropEmptySteps(tcId: string): Promise<{ removed: number; removedSeqs: number[]; stepCount: number }> {
+    const raw = await this.fetchRawTestcase(tcId);
+    const current = await this.fetchStepsCollection(tcId, raw);
+    const live = current.filter((r) => r?.deleted !== true);
+    const blanks = live.filter((r) => isBlankStep(r));
+    if (!blanks.length || blanks.length === live.length) {
+      return { removed: 0, removedSeqs: [], stepCount: live.length };
+    }
+    const ids = new Set(blanks.map((r) => str(r, 'id', '_id')).filter((v): v is string => !!v));
+    if (!ids.size) return { removed: 0, removedSeqs: [], stepCount: live.length };
+    const tc = await this.getTestCase(tcId);
+    const kept = (tc.steps ?? []).filter((s) => !(s.sourceId && ids.has(s.sourceId)));
+    if (!kept.length || kept.length === (tc.steps ?? []).length) {
+      return { removed: 0, removedSeqs: [], stepCount: live.length };
+    }
+    tc.steps = kept;
+    await this.updateTestCase(tcId, tc);
+    const after = (await this.fetchStepsCollection(tcId, await this.fetchRawTestcase(tcId)))
+      .filter((r) => r?.deleted !== true);
+    return {
+      removed: Math.max(0, live.length - after.length),
+      removedSeqs: blanks.map((r) => Number(r?.seq ?? 0)).filter((n) => n > 0),
+      stepCount: after.length,
+    };
+  }
+
   /** Snapshot the CURRENT server state of a testcase under a NEW version name — same TC id,
    *  new `tcfn_version` row with cloned steps. Backed by `PUT /tm/testcase` with
    *  `operation:"SAVENEWVERSION"` (see tcfn.service.js:115/242/355 for the branches). The steps
@@ -5254,7 +5348,7 @@ export class SimplifyQaAdapter {
     // tc_save (objects/parameters resolved); only the version stub + operation differ — exactly what
     // the SQA UI's "Save as new version" dialog sends (edited steps + operation SAVENEWVERSION).
     if (opts.tc) {
-      const tc = opts.tc;
+      const tc = withoutBlankSteps(opts.tc);
       // tdCopy clones the SOURCE version's iterations. A caller that just says "copy the test data"
       // (no sourceVersionId) must still get it — otherwise verData has no selVersionId and the new
       // version's iteration is created EMPTY. Default to the TC's current version.
@@ -6196,6 +6290,20 @@ export class SimplifyQaAdapter {
     }
   }
 
+  /** Display names for numeric action ids (a saved step carries `actionType = String(actionId)`), e.g. { "184": "Click" }.
+   *  Best effort: an id the catalog does not know is left out. */
+  async actionNamesById(ids: string[]): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    const catalog = await this.actionCatalog();
+    for (const raw of ids) {
+      if (!/^\d+$/.test(raw.trim())) continue;
+      const meta = catalog.get(`id::${Number.parseInt(raw, 10)}`);
+      const name = meta?.displayName ?? meta?.name;
+      if (name) out[raw] = name;
+    }
+    return out;
+  }
+
   /** Steps for one FN version. Unlike TC docs, the FN doc from `/tm/function/:id/:projectId`
    *  doesn't carry a versionId inline — callers resolve the target versionId (usually the newest,
    *  from `fetchFunctionVersionRows`) and pass it here. */
@@ -6686,6 +6794,30 @@ export class SimplifyQaAdapter {
       };
     }
     return undefined;
+  }
+
+  /** Every action row of the active project, full documents (for a backup/verify of the Action
+   *  catalogue before an AI "sync actions" run, which SimplifyQA applies server-side). */
+  async listAllActionsFull(): Promise<Array<Record<string, any>>> {
+    const projectId = this.requireProjectId();
+    const raw = await this.http.postJson<any>('/tm/action/search', {
+      searchFields: [{ column: 'deleted', value: false }, { column: 'projectId', value: { $in: [0, projectId] } }],
+      startIndex: 0,
+      limit: 100000,
+      selectFields: ['id', 'code', 'name', 'disname', 'uniqueId', 'type', 'groupName', 'objectRequired',
+        'deprecated', 'projectId', 'objectTemplate', 'parameters', 'returnType', 'description'],
+    });
+    return pickArray(raw, 'data', 'content', 'actions').filter((r: unknown) => !!r && typeof r === 'object');
+  }
+
+  /** Re-create one action from a backup snapshot (the row's own shape, minus its ids/timestamps). */
+  async createActionFromBackup(row: Record<string, any>): Promise<{ id: string }> {
+    const projectId = this.requireProjectId();
+    const body: Record<string, unknown> = { ...row, projectId: Number(projectId) };
+    for (const k of ['id', '_id', '__v', 'createdAt', 'updatedAt', 'createdBy', 'updatedBy', 'deleted']) delete body[k];
+    const raw = await this.http.postJson<any>('/tm/action', body);
+    const doc = raw?.data ?? raw;
+    return { id: String(doc?.id ?? doc?._id ?? '') };
   }
 
   private actionCatalog(): Promise<Map<string, ActionCatalogEntry>> {
@@ -8690,14 +8822,15 @@ export class SimplifyQaAdapter {
     if (input.pipelineType === 'SU') {
       const suite = await this.readOwnSuite(input.parentId);
       parentId = Number(suite['id']);
-      platForm = suitePlatform(suite, input.browser, 'create its pipeline');
+      // A CLOUD pipeline is headless (the cloud picker): bind the *_HEADLESS platform, like a cloud run does.
+      platForm = suitePlatform(suite, input.browser, 'create its pipeline', input.mode === 'cloud');
     } else {
       const tc = await this.fetchRawTestcase(input.parentId);
       if (!Object.keys(tc).length || tc.deleted === true) throw new Error(`Test case ${input.parentId} not found.`);
       if (Number(tc.projectId) !== projectId) throw new Error(`${tc.code ?? `TC-${tc.id}`} is not in project ${projectId}.`);
       parentId = Number(tc.id);
       parentVersion = testcaseVersion(tc, true).versionId || undefined;
-      platForm = tcPlatform(tc, input.browser);
+      platForm = tcPlatform(tc, input.browser, input.mode === 'cloud');
     }
     const body: Record<string, unknown> = {
       name: input.name, projectId, pipelineType: input.pipelineType, parentId,
@@ -9927,6 +10060,111 @@ export class SimplifyQaAdapter {
       }
     }
     return { checked, repaired, versions: fixed };
+  }
+
+  /** Turn part of a step's object locator into a PARAMETER OF THE OBJECT, the way the SimplifyQA editor does:
+   *  the object's locator carries `{{<paramId>}}`, the step lists that id in `objectParameterIds` (the "Parameter of
+   *  object" field), and the value lives in the test-data cell. Without `confirm` nothing is written — it reports what
+   *  would change. The object is SHARED: every step that uses it resolves the same token. */
+  async objectParameterize(input: ObjectParameterizeInput): Promise<ObjectParameterizeResult> {
+    const projectId = this.requireProjectId();
+    const name = (input.parameterName ?? '').trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(`parameterName "${input.parameterName}" must be a plain name (letters, digits, underscore; not starting with a digit), like menu_name.`);
+    }
+    const literal = (input.replace ?? input.value ?? '').trim();
+    if (!literal) throw new Error('Say which part of the locator becomes the parameter: pass `replace` (e.g. "PIM") or a `value`.');
+    const value = input.value ?? literal;
+
+    const pinned = input.versionId ? await this.resolveTcVersion(input.tcId, input.versionId) : undefined;
+    const tc = await this.getTestCase(input.tcId, pinned?.id);
+    const step = (tc.steps ?? []).find((s) => s.n === input.step);
+    if (!step) throw new Error(`${input.tcId} has no step ${input.step} (it has ${tc.steps?.length ?? 0}).`);
+    const objectId = step.sourceObjectId ?? step.objectRef?.id;
+    if (!objectId) throw new Error(`Step ${input.step} of ${input.tcId} has no object — only a step that uses an object can have a parameter of the object.`);
+
+    const sameObjectSteps = (tc.steps ?? []).filter((s) => String(s.sourceObjectId ?? s.objectRef?.id ?? '') === String(objectId));
+    const rawObj = await this.http.getJson<any>(`/tm/object/${numericId(String(objectId))}`);
+    const doc: any = (rawObj?.data && typeof rawObj.data === 'object' ? rawObj.data : rawObj) ?? {};
+    const attrs: Array<{ name: string; value: string; unique?: boolean }> = (Array.isArray(doc.attributes) ? doc.attributes : [])
+      .map((a: any) => ({ name: String(a?.name ?? ''), value: String(a?.value ?? ''), ...(a?.unique === true ? { unique: true } : {}) }));
+    const objectName = str(doc, 'disname', 'name') ?? step.objectRef?.name ?? String(objectId);
+    const wantedLocator = input.locator?.trim().toLowerCase();
+    const hits = attrs.filter((a) => (!wantedLocator || a.name.toLowerCase() === wantedLocator) && a.value.includes(literal));
+
+    const existingId = await this.findParameterId(projectId, name);
+    const alreadyTokenised = existingId != null && attrs.some((a) => a.value.includes(`{{${existingId}}}`));
+    if (!hits.length && !alreadyTokenised) {
+      throw new Error(
+        `No locator of object "${objectName}" contains "${literal}"${wantedLocator ? ` in the "${input.locator}" locator` : ''}. ` +
+        `Its locators: ${attrs.map((a) => `${a.name} = ${a.value}`).join(' | ') || '(none)'}.`,
+      );
+    }
+    const notes: string[] = [
+      `Object "${objectName}" is shared: every step that uses it resolves {{${name}}} from its own test data, so other test cases using this object need a value for ${name} too.`,
+    ];
+    const tokenFor = (id: number | string): string => `{{${id}}}`;
+    const changes = hits.map((a) => ({ locator: a.name, before: a.value, after: a.value.split(literal).join(tokenFor(existingId ?? name)) }));
+    const base = { tcId: input.tcId, step: input.step, steps: sameObjectSteps.map((s) => s.n), objectId: String(objectId), objectName, value, notes };
+    if (input.confirm !== true) {
+      return { ...base, written: false, parameter: { name, ...(existingId != null ? { id: existingId } : {}) }, changes, testdata: 'preview' };
+    }
+
+    const paramId = await this.getOrCreateParameter(projectId, Number(doc.moduleId) || 0, name, value);
+    const done = hits.map((a) => ({ locator: a.name, before: a.value, after: a.value.split(literal).join(tokenFor(paramId)) }));
+    if (hits.length) {
+      await this.updateObject(String(objectId), {
+        locators: hits.map((a) => ({ name: a.name, value: a.value.split(literal).join(tokenFor(paramId)), ...(a.unique ? { unique: true } : {}) })),
+      });
+    }
+    // A parameter that was a PLAIN one on this step (a recording typed `${name}` in the text) becomes the object's: leaving the
+    // plain binding and the token would make the save bind it twice (the editor shows it under Parameter AND Parameter of object).
+    const tokenRe = new RegExp(`\\s*\\$\\{\\s*${name}\\s*\\}`, 'g');
+    // EVERY step of this test case that uses the object resolves the token now, so each one lists the parameter. The backend
+    // seeds the test-data cell from the FIRST step that lists it, so the value goes on each of them (not only the chosen step).
+    const ops = sameObjectSteps.map((s) => {
+      const cleaned = s.description.replace(tokenRe, '').trim();
+      const plain = (s.sourceParameterIds ?? []).includes(paramId);
+      return {
+        op: 'update_step' as const, n: s.n,
+        patch: {
+          sourceObjectParameterIds: [...new Set([...(s.sourceObjectParameterIds ?? []), paramId])],
+          sourceRecordedParam: { ...(s.sourceRecordedParam ?? {}), [String(paramId)]: value },
+          ...(plain ? { sourceParameterIds: (s.sourceParameterIds ?? []).filter((p) => p !== paramId) } : {}),
+          ...(cleaned !== s.description && cleaned ? { description: cleaned } : {}),
+        },
+      };
+    });
+    try {
+      await this.editStepsDirect(input.tcId, ops, input.versionId);
+    } catch (e) {
+      // the step did not take the parameter — put the object's locators back so nothing is left half-done
+      if (hits.length) {
+        try { await this.updateObject(String(objectId), { locators: hits.map((a) => ({ name: a.name, value: a.value, ...(a.unique ? { unique: true } : {}) })) }); } catch { /* reported below */ }
+      }
+      throw new Error(`The step could not be updated (${e instanceof Error ? e.message : String(e)}); the object's locators were put back.`);
+    }
+
+    // The backend seeds the cell from the step's recorded value on save; confirm it really holds the value.
+    let testdata: ObjectParameterizeResult['testdata'] = 'not-checked';
+    try {
+      const tpl = await this.getDefaultIteration({ tcId: input.tcId, ...(pinned ? { versionId: pinned.id } : {}) });
+      const p = tpl.parameters.find((x) => x.paramId === paramId);
+      if (!p) {
+        notes.push(`${name} is not in the test-data template yet — open the test data to confirm the column.`);
+      } else if (p.protected) {
+        testdata = 'not-checked';
+      } else if (p.seed !== '') {
+        testdata = 'seeded';
+      } else {
+        const r = await this.patchTestdataCells({ tcId: input.tcId, cells: [{ paramName: name, value }], versionId: tpl.versionId, environmentType: tpl.environmentType });
+        testdata = r.patched > 0 ? 'patched' : 'not-checked';
+        if (!r.patched) notes.push(...r.skipped);
+      }
+    } catch (e) {
+      notes.push(`Could not confirm the test-data value: ${e instanceof Error ? e.message : String(e)}.`);
+    }
+    return { ...base, written: true, parameter: { name, id: paramId }, changes: done, testdata };
   }
 
   /** Environment key: caller wins; else fetch the project's configured envs and pick the first;

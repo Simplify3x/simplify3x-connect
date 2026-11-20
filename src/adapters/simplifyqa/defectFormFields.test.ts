@@ -164,7 +164,7 @@ describe('defect_create — the rest of the form', () => {
       [{ executionType: 'Hybrid' }, /not a defect type \(execution type\).*Manual, Automation/s],
       [{ featureId: 'FT-999' }, /No feature "FT-999" in this project/],
       [{ plannedStartDate: '20/11/2026' }, /Planned start date must be a date like 2026-11-20/],
-      [{ plannedStartDate: '2026-11-25', plannedEndDate: '2026-11-20' }, /Planned end date \(2026-11-20\) must be on or after the planned start date/],
+      [{ plannedStartDate: '2026-11-25', plannedEndDate: '2026-11-20' }, /Planned end date \(2026-11-20\) must be after the planned start date/],
     ];
     for (const [extra, msg] of cases) {
       const { a, st } = backend();
@@ -217,7 +217,7 @@ describe('defect_update — the rest of the form', () => {
     const { a, st } = backend();
     await a.createDefect({ name: 'Some defect', plannedStartDate: '2026-12-10' });
     const before = st.puts.length;
-    await expect(a.updateDefect('DE-75', { plannedEndDate: '2026-12-01' })).rejects.toThrow(/must be on or after the planned start date \(2026-12-10\)/);
+    await expect(a.updateDefect('DE-75', { plannedEndDate: '2026-12-01' })).rejects.toThrow(/must be after the planned start date \(2026-12-10\)/);
     expect(st.puts.length).toBe(before);
   });
 

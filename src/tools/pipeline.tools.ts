@@ -51,7 +51,7 @@ export function registerPipelineTools(server: McpServer, deps: PipelineDeps): vo
         releaseId: z.string().optional().describe('create / update: release id (required to create).'),
         sprintId: z.string().optional().describe('create / update: sprint id (required to create).'),
         environment: z.string().optional().describe('create / update: environment name or key (default general).'),
-        browser: z.string().optional().describe('create: browser for the WEB test cases — the test case, or every WEB test case in the suite (default chrome).'),
+        browser: z.string().optional().describe('create: browser for the WEB test cases — the test case, or every WEB test case in the suite (default chrome). A CLOUD pipeline is headless: only Chrome Headless, Firefox Headless or Edge Headless exist there (pass chrome / firefox / edge).'),
         description: z.string().optional().describe('create / update.'),
         confirm: z.boolean().optional().describe('delete: true on the SECOND call, only after the user explicitly said to delete.'),
       },

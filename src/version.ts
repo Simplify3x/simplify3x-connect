@@ -6,4 +6,4 @@
  * the code still announced 0.27.0. `src/version.test.ts` fails when the two disagree, so a release
  * that forgets this file is caught before publishing rather than after.
  */
-export const VERSION = '0.31.3';
+export const VERSION = '0.31.9';

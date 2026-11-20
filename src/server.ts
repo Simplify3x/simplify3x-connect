@@ -14,6 +14,7 @@ import { registerRunTools } from './tools/run.tools.js';
 import { registerSuiteManageTools } from './tools/suiteManage.tools.js';
 import { registerExecutionPlanTools } from './tools/executionPlan.tools.js';
 import { registerReleaseSprintTools } from './tools/releaseSprint.tools.js';
+import { registerObjectParameterizeTool } from './tools/objectParameterize.tools.js';
 import { registerDefectUpdateTool } from './tools/defectUpdate.tools.js';
 import { registerDefectFromStepTools } from './tools/defectFromStep.tools.js';
 import { registerTestPlanTools } from './tools/testPlan.tools.js';
@@ -28,6 +29,7 @@ import { registerAttachmentTools } from './tools/attachment.tools.js';
 import { registerProjectTools } from './tools/project.tools.js';
 import { registerEnvironmentTools } from './tools/environment.tools.js';
 import { registerImportTools } from './tools/import.tools.js';
+import { registerActionBackupTools } from './tools/actionBackup.tools.js';
 import { registerFormulaTools } from './tools/formulas.tools.js';
 import { registerDefectTools } from './tools/defects.tools.js';
 import { registerTaskTools } from './tools/tasks.tools.js';
@@ -186,6 +188,7 @@ export function recordingInstructionsFor(provider: 'walnut' | 'simplifyqa' | 'un
       '  It always filters `deleted:false`, scopes to the active project, rejects unknown fields locally, and resolves custom fields: `op:"custom_fields"` returns label → key → `customFields.<key>`; then pass the label with `custom:true` in `where`. Test cases have NO priority/status columns — use `reviewApproveStatus` or a custom field. The one exception is a FAILED run: analyse it with `failure_analysis` (below), not by reading its steps with `sqa_query`.',
       'COLUMN PREFERENCES (user-level, per list view): `column_preference({ action:"set", lists:["epic","feature","userstory"], column:"Created On" })` shows that column in the SimplifyQA UI list view (the same write as ticking it in Column Preference); `enabled:false` hides it; `action:"get"` reports the current columns. Lists: epic, feature, userstory, testcase (Test Case list), suite (Suite test cases), scenario (Test plan test cases), executionplan (Execution Plan test cases — e.g. column:"Execution Type"). It takes effect on the UI after a refresh.',
       'SPREADSHEET IMPORT: `excel_import({ filePath:"<absolute path>", kind:"testcases"|"testdata"|"plan_entries" })` reads .xlsx/.csv/.tsv the way the UI Import does. testcases: one MANUAL TC per row (name/title required; description, steps (newline or | separated), expected result, module, story headers). testdata: needs tcId + environmentType, one iteration per row, columns = parameter names. plan_entries: needs planId, first column = test case codes. It reports created/added and every rejected row; `dryRun:true` writes nothing. Never say the MCP cannot import a spreadsheet.',
+      'ACTION CATALOGUE (Object Templates): a "sync actions" run is applied SERVER-SIDE by SimplifyQA and can replace an Object Template\'s action list. Before such a sync call `action_template_backup({ action:"save" })` (snapshot of every action + count per template); after it `action:"verify"` lists the actions a template lost and `action:"restore"` (dry-run first, then `confirm:true`) re-creates exactly those — it never deletes or edits an action.',
       'ATTACHMENTS (epic / feature / user story / defect): `attachment_add({ entityType:"epic"|"feature"|"userstory"|"defect", itemId, filePath:"<absolute path>" })` uploads one file and reads the item\'s attachments back to confirm; the file appears in the UI\'s Attachments section. A screenshot pasted in chat has no local path — ASK for its absolute path (or accept base64 + fileName). `attachment_delete({ entityType, itemId, attachment })` removes a wrong upload.',
       'WATCH LIST (the UI email button): `epic_create` / `feature_create` / `story_create` accept `watchList:["email-or-name-or-id", …]`; for an existing item use `watch_list_add({ entityType, itemId, users:[…] })`. Emails/names/ids resolve to user ids and the item is re-read to confirm. Never say you cannot set the Watch List.',
       'LINKAGES (the UI Linkages section): `backlog_link({ sourceType:"epic"|"feature"|"userstory"|"defect", sourceId, destType:"defect"|"epic"|"feature"|"userstory"|"task", destId, linkType:"Clones" })`. linkType is the displayed link-type name; it is matched to the project link-type config (unknown → refused with the list) and the link is read back from /pm/linkages.',
@@ -205,6 +208,7 @@ export function recordingInstructionsFor(provider: 'walnut' | 'simplifyqa' | 'un
       '- **Updating an EXISTING test case\'s test data / adding a formula there: `tc_update_testdata({ tcId, environmentType, cells: [{ param, value } | { param, formula: { expression } }] })`.** It writes the DEFAULT iteration (ITR-1) - the row a run actually uses - and leaves every other column alone. `tc_generate_testdata` APPENDS iterations and never becomes the default, so a formula saved there does NOT affect the next run. Formulas must come from `tc_list_formulas` (never invent names); TODAY takes a QUOTED offset like `=TODAY("d+365")`, not `ddmmyyyy`.',
       '- **Suite-level test data is a SEPARATE store from the member test cases.** When the user says "SU-24 test data" / "suite level only", use `suite_get_testdata({ suiteId, environmentType })` to read it and `suite_copy_testdata({ suiteId, environmentType, from?, name? })` to copy a row (e.g. ITR-1 → ITR-2) — the copy is saved on the SUITE and NEVER touches the member test cases\' own test data; both tools read the rows back to confirm. Do NOT use tc_generate_testdata / tc_update_testdata on the member TCs for a suite-level request. To remove an iteration row created by mistake: `testdata_delete_iterations({ entityType:"TC"|"SU", tcId?|suiteId?, environmentType, iterations:["ITR-2"] })` — the DEFAULT row cannot be deleted.',
       '- Never record a rejected step (intent count == recorded-step count). Always supply object_name / parameter_name / step_description.',
+      '- **OBJECT PARAMETERIZATION ("use object parameterization", "make the menu item a parameter of the object"):** the recorder has no tool for it. Record the click normally on the REAL element (e.g. PIM) and write the parameter in the step_description as `${name}` — "Click side menu item ${menu_name}". Do NOT invent `object parameter menu_name = PIM` in your reply. tc_save then turns that click into a real "Parameter of object": the locator text (PIM) becomes `{{id}}` and the test data holds PIM. Check the save reply for the "Object parameter … set on step(s) …" line; if it says it could not, run `object_parameterize({ tcId, step, parameterName, value })`. If the save reply warns that an object parameter has an EMPTY test-data value, fix it yourself right away — `tc_update_testdata({ tcId, cells: [{ param: "menu_name", value: "PIM" }] })` with the value the user gave — and read the test data back; never leave it empty or tell the user it is set when it is not.',
       '- **THE MOMENT A RECORDING FINISHES, BEFORE ASKING TO SAVE: call `tc_suggest_function_groups({ sessionId })`.** It answers with two lists: `replace` — blocks of the recorded steps that ALREADY exist as a reusable function, and `create` — contiguous blocks worth extracting into a NEW function. Show BOTH and ASK the user per block: "create a new function (name?)", "replace with FN-x", or "keep as is" — never decide for them. APPLY AFTER the test case is saved (both need a saved tcId): `tc_steps_to_function({ tcId, stepSeqs, name, moduleId, replaceInSource: true })` for a create, `tc_replace_with_functions({ tcId, replace: [{ fnId, stepSeqs }] })` for a replace. If the lists are empty, say nothing and continue. This is a suggestion — it is NOT a save instruction.',
     ].join('\n');
   }
@@ -391,6 +395,9 @@ export function buildServer(deps: ServerDeps): McpServer {
   registerReleaseSprintTools(toolServer, {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
   });
+  registerObjectParameterizeTool(toolServer, {
+    getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+  });
   registerDefectUpdateTool(toolServer, {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
   });
@@ -435,6 +442,16 @@ export function buildServer(deps: ServerDeps): McpServer {
   // Spreadsheet import (.xlsx / .csv / .tsv) — test cases, test data, execution-plan entries.
   registerImportTools(toolServer, {
     getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+  });
+
+  // Action catalogue backup/verify/restore — protects Object Templates from a bad sync-actions run.
+  registerActionBackupTools(toolServer, {
+    getAdapter: () => (deps.connection ? deps.connection.adapter() : deps.adapter),
+    getProjectId: () => {
+      const d = deps.connection?.describe();
+      const id = d?.projectId;
+      return id ? Number(id) : undefined;
+    },
   });
 
   // Formula discovery (tc_list_formulas) — companion to tc_generate_testdata's `formulas` option, so

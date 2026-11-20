@@ -21,7 +21,7 @@ You need your **SimplifyQA URL** and an **API token** from your SimplifyQA profi
 ```
 
 **Claude Desktop:** download
-[simplify3x-connect-0.31.3.mcpb](https://github.com/Simplify3x/simplify3x-connect/releases/download/v0.31.3/simplify3x-connect-0.31.3.mcpb)
+[simplify3x-connect-0.31.9.mcpb](https://github.com/Simplify3x/simplify3x-connect/releases/download/v0.31.9/simplify3x-connect-0.31.9.mcpb)
 and double-click it, or use **Settings → Extensions → Install extension**. Enter your URL and token
 when asked. No Node.js or npm needed.
 

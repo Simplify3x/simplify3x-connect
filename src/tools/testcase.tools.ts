@@ -14,6 +14,8 @@ import { zCategory, zDraftOp, zNewStep, zPriority } from './schemas.js';
 import { emitTcEdit, openTcViewerWindow, refreshRecorderWindow } from './tcEditPublisher.js';
 import { nextVersionName, latestVersionId } from '../versionName.js';
 import { recordingName } from './recordingNames.js';
+import { backfillRecordedValues, recordedValuesOf, warnEmptyObjectParameters } from './recordedValues.js';
+import { applyObjectParameters } from './autoObjectParams.js';
 import { askReplaceText, findFunctionCandidatesForTc, findFunctionMatches, proposeFunctionGroups, replaceMatchedRuns, selectMatches, suggestionText, type FnMatch } from './functionReuse.js';
 
 // `| undefined` throughout: see the NOTE ON `| undefined` in domain/types.ts --
@@ -524,10 +526,11 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         ),
         steps: z.array(zNewStep).optional(),
         technologyType: z.string().optional().describe(
-          'SimplifyQA-only: the automation stack this test case targets — WEB | API | ANDROID | IOS | ' +
-            'DATABASE | MAINFRAME | DESKTOP | SAP. REQUIRED when the draft is built only from FUNCTION ' +
-            'calls (a function call carries no technology of its own); otherwise it is derived from the ' +
-            'steps, or from the called functions\' fnType at save time.',
+          'SimplifyQA-only: the test case\'s TECHNOLOGY (the form\'s Type) — WEB | API | ANDROID | IOS | ' +
+            'DATABASE | MAINFRAME | DESKTOP | SAP. Applies to MANUAL test cases too (a manual Desktop/Android/' +
+            'iOS/API case is saved with that technology, not WEB). REQUIRED when the draft is built only from ' +
+            'FUNCTION calls; otherwise it is derived from the steps, or from the called functions\' fnType at ' +
+            'save time.',
         ),
         executionPlatform: z.object({
           id: z.string(), name: z.string(), technologyType: z.string(), type: z.string(),
@@ -1330,6 +1333,9 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
             return err(`Could not append the recorded steps to ${recordingTarget.testcaseId}: ${describeError(e)}`);
           }
         }
+        // What the recording typed, read BEFORE the recorder saves: its Save can leave a bound parameter's cell empty.
+        let recordedValues = new Map<string, string>();
+        try { if (adapter.readJournal) recordedValues = recordedValuesOf(await adapter.readJournal(sessionId)); } catch { /* best effort */ }
         try {
           res = await adapter.callRaw('core_save_session', { sessionId, timeoutMs: 60000 });
         } catch (e) {
@@ -1364,6 +1370,8 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
                 }
               }
               fbCopy += await healTestdata(adapter, fb.id);
+              fbCopy += await applyObjectParameters(adapter, fb.id);
+              fbCopy += await warnEmptyObjectParameters(adapter, fb.id);
               const fbFormula = fb.formulasApplied
                 ? `\n${fb.formulasApplied} formula(s) were applied to the default test-data row.` +
                   (fb.formulaSkipped?.length ? ` Skipped: ${fb.formulaSkipped.join('; ')}.` : '')
@@ -1392,6 +1400,22 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         }
         const code = saved?.code != null ? String(saved.code) : String(id);
         const verb = saved?.created === false ? 'Updated' : 'Created';
+        // Step-count parity (DE-2320): the editor seeds a NEW test case with one blank row and the
+        // recorder window's own Save can store it, so one recorded step ends up as two. Drop those
+        // rows and report the real count so the window and the test case agree.
+        let blankNote = '';
+        let stepCount: number | undefined;
+        if (adapter.dropEmptySteps) {
+          try {
+            const d = await adapter.dropEmptySteps(String(id));
+            stepCount = d.stepCount;
+            if (d.removed > 0) {
+              blankNote = `\nRemoved ${d.removed} empty placeholder step(s) the recorder window had left in the save` +
+                (d.removedSeqs.length ? ` (step ${d.removedSeqs.join(', ')})` : '') +
+                ` — ${code} now has ${d.stepCount} step(s).`;
+            }
+          } catch { /* best effort — the save itself already succeeded */ }
+        }
         const savedVersion = typeof saved?.versionName === 'string' ? saved.versionName : undefined;
         const versionNote = savedVersion ? ` as ${savedVersion}` : '';
         const productUrl = typeof saved?.productUrl === 'string' ? saved.productUrl : undefined;
@@ -1422,13 +1446,20 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
         const formulaNote = formulasApplied > 0
           ? `\n${formulasApplied} recorded formula(s) applied to the default test-data iteration.`
           : '';
-        return ok(`${verb} test case ${code}${versionNote}.${link}${copyNote}${fnNote}${formulaNote}`, {
+        // Test data copied from a source manual TC wins over whatever the recording typed.
+        // A click step whose text says ${name} is an OBJECT parameter the recorder could not mark: make it one now (no second tool).
+        const objectNote = await applyObjectParameters(adapter, String(id));
+        const filled = (copyTestdataFrom ? '' : await backfillRecordedValues(adapter, String(id), recordedValues)) + objectNote;
+        // anything still empty after the fill-ins is reported, with the call that fixes it — never left silent
+        const valuesNote = filled + (copyTestdataFrom ? '' : await warnEmptyObjectParameters(adapter, String(id)));
+        return ok(`${verb} test case ${code}${versionNote}.${link}${copyNote}${fnNote}${formulaNote}${valuesNote}${blankNote}`, {
           saved: {
             id: String(id),
             ...(productUrl ? { productUrl } : {}),
             ...(copyTestdataFrom ? { copyTestdataFrom } : {}),
             ...(formulasApplied > 0 ? { formulasApplied } : {}),
             ...(savedVersion ? { versionName: savedVersion } : {}),
+            ...(stepCount !== undefined ? { stepCount } : {}),
           },
         });
       }
@@ -1509,7 +1540,13 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
             const name = m[1]!;
             const hasData = Object.prototype.hasOwnProperty.call(data, name) && data[name] !== '';
             const hasStepValue = draft.tc.category !== 'manual' && s.value !== undefined && s.value !== '';
-            if (!hasData && !hasStepValue) missing.push({ n: s.n, name });
+            // A RECORDED step keeps the value it used in `recordedParam` (that is what the recorder
+            // captured while locating the element), not in `data` or `value`. The save builder binds
+            // it and the backend writes it into the default test-data row — refusing it here made a
+            // recorded step unsaveable and its parameter land with an EMPTY cell.
+            const hasRecorded = typeof s.recordedParam?.[name] === 'string'
+              && (s.recordedParam[name] as string).trim() !== '';
+            if (!hasData && !hasStepValue && !hasRecorded) missing.push({ n: s.n, name });
           }
         }
         if (missing.length) {
@@ -1517,9 +1554,9 @@ export function registerTestcaseTools(server: McpServer, deps: TestcaseToolsDeps
           const perStep = missing.map((m) => `step ${m.n}: \${${m.name}}`).join(', ');
           return err(
             `Cannot save "${draft.tc.title}" — these step tokens have no resolvable value: ${perStep}. ` +
-              'Every `${name}` token needs either a default in the TC\'s `data` map, or (for automated/' +
-              'playwright steps) a `value` set on that step — otherwise the parameter gets bound with ' +
-              'nothing to resolve at execution. Update the draft: ' +
+              'Every `${name}` token needs a default in the TC\'s `data` map, a `value` on that step ' +
+              '(automated steps), or the recorded value in that step\'s `recordedParam` — otherwise the ' +
+              'parameter gets bound with nothing to resolve at execution. Update the draft: ' +
               `tc_draft_update({ draftId: "${draftId}", ops: [{ op: "set_meta", patch: { data: { ${uniqueNames.map((n) => `${n}: "<value>"`).join(', ')} } } }] }) ` +
               'then retry tc_save.',
           );
